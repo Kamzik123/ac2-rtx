@@ -5,6 +5,7 @@
 #include "renderer.hpp"
 #include "ac2_dump.hpp"
 #include "ac2_ff.hpp"
+#include "ac2_lights.hpp"
 #include "shared/common/shader_cache.hpp"
 
 namespace comp
@@ -113,6 +114,10 @@ namespace comp
 
 	HRESULT d3d9ex::D3D9Device::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 	{
+		// Lights are gathered per draw and submitted once per frame. Remix's model is
+		// create-per-frame with the hash carrying identity across frames, so this has
+		// to run every frame, before the present that consumes them.
+		ac2_lights::frame_end();
 		return m_pIDirect3DDevice9->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 	}
 
@@ -514,9 +519,12 @@ namespace comp
 	HRESULT d3d9ex::D3D9Device::CreateVertexShader(CONST DWORD* pFunction, IDirect3DVertexShader9** ppShader)
 	{
 		// AC2's shaders live in MaterialTemplate assets, not the exe - but they all
-		// come through here as bytecode. Dump + disassemble each unique one.
-		ac2_dump::on_create_vertex_shader(pFunction);
-		return m_pIDirect3DDevice9->CreateVertexShader(pFunction, ppShader);
+		// come through here as bytecode. Dump + disassemble each unique one, and
+		// register its vegetation family (needs the created object, so: after).
+		const HRESULT hr = m_pIDirect3DDevice9->CreateVertexShader(pFunction, ppShader);
+		if (SUCCEEDED(hr) && ppShader)
+			ac2_dump::on_create_vertex_shader(pFunction, *ppShader);
+		return hr;
 	}
 
 	HRESULT d3d9ex::D3D9Device::SetVertexShader(IDirect3DVertexShader9* pShader)
@@ -617,6 +625,12 @@ namespace comp
 
 	HRESULT d3d9ex::D3D9Device::SetPixelShaderConstantF(UINT StartRegister, CONST float* pConstantData, UINT Vector4fCount)
 	{
+		// Shadow every PS constant write. The per-draw LIGHT SET lives here
+		// (g_OmniLights c32, g_DirectLights c40, g_SpotLights c44), and it is the
+		// only in-sync source for it: engine memory is stale at draw time because of
+		// the deferred command buffer, and Get* readback across the Remix bridge is
+		// not trustworthy. Same reasoning as the VS constant shadow.
+		ac2_lights::on_set_ps_constant_f(StartRegister, pConstantData, Vector4fCount);
 		return m_pIDirect3DDevice9->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
 	}
 

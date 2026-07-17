@@ -1,6 +1,7 @@
 #include "std_include.hpp"
 #include "ac2_dump.hpp"
 #include "ac2_ff.hpp"
+#include "ac2_lights.hpp"
 
 #include <cfloat>
 #include <cmath>
@@ -88,12 +89,19 @@ namespace comp::ac2_dump
 			// mapped, and a draw guarantees that. call_once so the byte writes
 			// happen exactly once even though draws come from many threads.
 			//
-			// CullAABB is deliberately NOT applied here: it can crash during LOADING.
-			// Enable it with PAGE DOWN once you're in-world.
+			// CullAABB is deliberately NOT applied here: it can crash during LOADING,
+			// and it turns out to be UNNECESSARY - disabling the hardware occlusion
+			// cull below brings the missing objects back on its own (user-confirmed).
+			// Enable it with PAGE DOWN only if you have a reason to.
+			//
+			// The occlusion patch IS applied by default: it is the culling system that
+			// actually mattered, and it's a data write, so it carries none of the
+			// torn-byte risk that makes CullAABB dangerous.
 			static std::once_flag s_patch_once;
 			std::call_once(s_patch_once, []
 			{
 				ac2_ff::set_anticulling(true);
+				ac2_ff::set_occlusion_disabled(true);
 			});
 
 			static std::uint32_t tick = 0;
@@ -115,13 +123,6 @@ namespace comp::ac2_dump
 			}
 			prev_stage = stage;
 
-			// F3 / F2: nudge the depth bias on converted geometry (z-fight escape hatch)
-			static bool prev_up = false, prev_dn = false;
-			const bool up = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
-			const bool dn = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
-			if (up && !prev_up) { ac2_ff::g_depth_bias += 1.0e-6f; Beep(1400, 40); }
-			if (dn && !prev_dn) { ac2_ff::g_depth_bias -= 1.0e-6f; Beep(900, 40); }
-			prev_up = up; prev_dn = dn;
 
 			// INSERT: FF-ONLY mode - drop everything we can't convert, so the scene
 			// is purely our fixed-function geometry. Isolates FF vs vertex capture.
@@ -145,15 +146,42 @@ namespace comp::ac2_dump
 			}
 			prev_skin = skin;
 
-			// DELETE: game-side anti-culling (patch the VisualsCulling submission gate)
-			static bool prev_ac = false;
-			const bool ac = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
-			if (ac && !prev_ac)
+			// END: CPU-generated vegetation trunks. Separates "the trunk port is
+			// wrong" from "the rest of the FF path is wrong" in one keypress - the
+			// same job INSERT does for coverage-vs-culling.
+			static bool prev_veg = false;
+			const bool veg = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+			if (veg && !prev_veg)
 			{
-				ac2_ff::set_anticulling(!ac2_ff::g_anticull);
-				Beep(ac2_ff::g_anticull ? 2400 : 400, 90);
+				ac2_ff::g_veg_trunks = !ac2_ff::g_veg_trunks;
+				Beep(ac2_ff::g_veg_trunks ? 2000 : 500, 80);
 			}
-			prev_ac = ac;
+			prev_veg = veg;
+
+			// HOME is taken (Remix API), so leaves get F11: separate from trunks so
+			// the two ports can be blamed independently.
+			static bool prev_leaf = false;
+			const bool leaf = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+			if (leaf && !prev_leaf)
+			{
+				ac2_ff::g_veg_leaves = !ac2_ff::g_veg_leaves;
+				Beep(ac2_ff::g_veg_leaves ? 2200 : 550, 80);
+			}
+			prev_leaf = leaf;
+
+			// F2: normal-only materials (water / volume fog). Took over the key the
+			// depth-bias nudge used to own - that existed to stop converted geometry
+			// z-fighting coplanar decals, which turned out to be an UNTAGGED DECAL in
+			// Remix's config, not a depth problem. It had sat at 0 ever since.
+			static bool prev_no = false;
+			const bool no = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+			if (no && !prev_no)
+			{
+				ac2_ff::g_normal_only_materials = !ac2_ff::g_normal_only_materials;
+				Beep(ac2_ff::g_normal_only_materials ? 2600 : 600, 80);
+			}
+			prev_no = no;
+
 
 			// PAGE DOWN: force CullAABB -> "intersecting". OFF by default; this
 			// CRASHES once the whole world starts being submitted. Opt-in only.
@@ -165,6 +193,31 @@ namespace comp::ac2_dump
 				Beep(ac2_ff::g_cullaabb ? 2400 : 400, 90);
 			}
 			prev_ca = ca;
+
+			// PAGE UP: disable the game's hardware OCCLUSION culling (zero the
+			// 25-pixel threshold). Default off so it can be A/B'd separately from the
+			// frustum patches - it is an independent culling system. Sits next to
+			// PAGE DOWN because both are culling toggles.
+			static bool prev_occ = false;
+			const bool occ = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+			if (occ && !prev_occ)
+			{
+				ac2_ff::set_occlusion_disabled(!ac2_ff::g_occlusion_off);
+				Beep(ac2_ff::g_occlusion_off ? 2400 : 400, 90);
+			}
+			prev_occ = occ;
+
+			// HOME: bring up the Remix API and start submitting lights. Deliberately
+			// a manual toggle: it needs exposeRemixApi = True in .trexridge.conf,
+			// and a bad init crashes at STARTUP, where you cannot toggle anything off.
+			static bool prev_ra = false;
+			const bool ra = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+			if (ra && !prev_ra)
+			{
+				ac2_lights::g_remix_api = !ac2_lights::g_remix_api;
+				Beep(ac2_lights::g_remix_api ? 2800 : 300, 90);
+			}
+			prev_ra = ra;
 
 			// F12: read constants from our shadow (default) vs the bridge's
 			// GetVertexShaderConstantF. Proves which one is lying.
@@ -184,6 +237,7 @@ namespace comp::ac2_dump
 				write_report();
 				ac2_ff::arm_diagnostic();
 				ac2_ff::arm_skin_diagnostic();
+				ac2_ff::arm_tex_diagnostic();
 				Beep(880, 60);
 			}
 			if (toggle && !prev_toggle) { g_enabled = !g_enabled; Beep(g_enabled ? 660 : 330, 60); }
@@ -266,7 +320,41 @@ namespace comp::ac2_dump
 	void initialize() { ensure_init(); }
 
 	// -------------------------------------------------------------------------
-	void on_create_vertex_shader(const DWORD* pFunction)
+	// Which vegetation family is this VS, if any? Read straight off the constant
+	// table - the same trick the PS diffuse stage and the PS light counts use.
+	//
+	// Marker verified across all 5642 asset VS: no dcl_position <=> declares
+	// CompressionParams, 141 == 141, no exceptions. Within those, TrunkStencil
+	// and LeavesEquations are mutually exclusive and split the set 47/47/47.
+	static ac2_ff::veg_kind veg_kind_of(LPD3DXCONSTANTTABLE ct)
+	{
+		D3DXCONSTANTTABLE_DESC desc{};
+		if (!ct || FAILED(ct->GetDesc(&desc))) return ac2_ff::veg_kind::none;
+
+		bool compression = false, trunk = false, leaves = false;
+		for (UINT i = 0; i < desc.Constants; ++i)
+		{
+			D3DXHANDLE h = ct->GetConstant(nullptr, i);
+			if (!h) continue;
+			D3DXCONSTANT_DESC cd{};
+			UINT n = 1;
+			if (FAILED(ct->GetConstantDesc(h, &cd, &n)) || !cd.Name) continue;
+
+			const std::string nm = shared::utils::str_to_lower(cd.Name);
+			if (nm == "compressionparams")  compression = true;
+			else if (nm == "trunkstencil")  trunk = true;
+			else if (nm == "leavesequations") leaves = true;
+		}
+
+		// CompressionParams is the gate: without it the shader has a real
+		// dcl_position and the ordinary static path already handles it.
+		if (!compression) return ac2_ff::veg_kind::none;
+		if (trunk)  return ac2_ff::veg_kind::trunk;
+		if (leaves) return ac2_ff::veg_kind::leaves;
+		return ac2_ff::veg_kind::clutter;
+	}
+
+	void on_create_vertex_shader(const DWORD* pFunction, IDirect3DVertexShader9* shader)
 	{
 		if (!g_enabled || !pFunction) return;
 		ensure_init();
@@ -274,7 +362,31 @@ namespace comp::ac2_dump
 		const std::size_t size = shader_size_bytes(pFunction);
 		if (!size) return;
 
+		// Register the vegetation family BEFORE the dump's dedup below.
+		//
+		// The dedup is keyed on the BYTECODE hash and exists to avoid writing the
+		// same .asm twice. Registration is keyed on the SHADER OBJECT, and the game
+		// creates many objects from identical bytecode - so registering after the
+		// dedup would register only the first object of each shader and silently
+		// leave every later tree unconverted, while the counters happily reported
+		// "trunk shaders: registered". Different key, different lifetime, must not
+		// share the early-out.
 		const std::uint32_t hash = shared::utils::data_hash32(pFunction, size);
+		if (shader)
+		{
+			ac2_ff::veg_kind kind = ac2_ff::veg_kind::none;
+			if (p_get_constant_table)
+			{
+				LPD3DXCONSTANTTABLE vct = nullptr;
+				if (SUCCEEDED(p_get_constant_table(pFunction, &vct)) && vct)
+				{
+					kind = veg_kind_of(vct);
+					vct->Release();
+				}
+			}
+			// The hash rides along so the coverage table can be named offline.
+			ac2_ff::register_vs_info(shader, kind, hash);
+		}
 		{
 			std::lock_guard<std::mutex> lk(s_mutex);
 			if (!s_seen_shaders.insert(hash).second) return;
@@ -412,6 +524,28 @@ namespace comp::ac2_dump
 
 		int best = -1;
 		int best_rank = 99;
+		std::string best_name;
+
+		// Remember the normal map instead of just discarding it. If the shader turns
+		// out to have NO diffuse at any stage, a normal map is the difference between
+		// a real surface with no albedo (water/fog) and a genuine AO/depth pass. The
+		// former must still reach Remix; the latter must not.
+		int normal_reg = -1;
+		std::string normal_name;
+
+		// The per-draw light counts have to come from the constant TABLE, not from a
+		// constant: g_NumLights is VS-only, because the counts are baked into the
+		// pixel shader as literals (the PS variant IS the light count). But the table
+		// still declares how many registers each light array occupies, and the
+		// stride per light is fixed - so the declared size recovers the count:
+		//   g_OmniLights   @ c32, 2 regs/light  -> count = size/2  (max 4)
+		//   g_DirectLights @ c40, 2 regs/light  -> count = size/2  (max 2)
+		//   g_SpotLights   @ c44, 4 regs/light  -> count = size/4  (max 2)
+		// Verified against the asset shaders: PS variants declare c32x2 (1 omni) and
+		// VS declares c32x8 (the full 4), which matches the (4,2,2,1) clamp in
+		// LightingEnv::SelectAndSetLights.
+		int num_omni = 0, num_direct = 0, num_spot = 0;
+		bool has_sun = false;
 
 		D3DXCONSTANTTABLE_DESC desc{};
 		if (SUCCEEDED(ct->GetDesc(&desc)))
@@ -423,6 +557,17 @@ namespace comp::ac2_dump
 				D3DXCONSTANT_DESC cd{};
 				UINT n = 1;
 				if (FAILED(ct->GetConstantDesc(h, &cd, &n)) || !cd.Name) continue;
+
+				if (cd.RegisterSet == D3DXRS_FLOAT4)
+				{
+					const std::string ln = shared::utils::str_to_lower(cd.Name);
+					if (ln == "g_omnilights")        num_omni = static_cast<int>(cd.RegisterCount) / 2;
+					else if (ln == "g_directlights") num_direct = static_cast<int>(cd.RegisterCount) / 2;
+					else if (ln == "g_spotlights")   num_spot = static_cast<int>(cd.RegisterCount) / 4;
+					else if (ln == "g_shadoweddirect") has_sun = true;
+					continue;
+				}
+
 				if (cd.RegisterSet != D3DXRS_SAMPLER) continue;
 
 				const std::string nm = shared::utils::str_to_lower(cd.Name);
@@ -432,7 +577,16 @@ namespace comp::ac2_dump
 				// Operator6_0 / Operator143_0, and rejecting those threw away 49%
 				// of all draws (they fell back to the shader path, which Remix
 				// can't consume -> most of the world went missing).
-				if (nm.find("normal") != std::string::npos) continue;
+				if (nm.find("normal") != std::string::npos)
+				{
+					// Lowest normal sampler wins, same tie-break as the diffuse.
+					if (normal_reg < 0 || static_cast<int>(cd.RegisterIndex) < normal_reg)
+					{
+						normal_reg = static_cast<int>(cd.RegisterIndex);
+						normal_name = cd.Name;
+					}
+					continue;
+				}
 				if (nm.find("specular") != std::string::npos) continue;
 				if (nm.find("depth") != std::string::npos) continue;
 				if (nm.find("shadow") != std::string::npos) continue;
@@ -454,12 +608,29 @@ namespace comp::ac2_dump
 				{
 					best_rank = rank;
 					best = static_cast<int>(cd.RegisterIndex);
+					best_name = cd.Name;
 				}
 			}
 		}
 		ct->Release();
 
-		ac2_ff::register_ps_diffuse_stage(shader, best);
+		// No diffuse anywhere, but there IS a normal map => a real surface with no
+		// albedo (AC2's water and volume fog), not an AO/depth pass. Bind the normal
+		// map as rank 4 so the draw reaches Remix at all and Remix has a texture to
+		// hash and categorise. See ps_diffuse_info in the header for why we do not
+		// try to tell water and fog apart here.
+		if (best < 0 && normal_reg >= 0)
+		{
+			ac2_ff::register_ps_diffuse_stage(shader, normal_reg, 4, normal_name.c_str(), true);
+			ac2_lights::register_ps_lights(shader, num_omni, num_direct, num_spot, has_sun);
+			return;
+		}
+
+		// Carry HOW the stage was chosen, not just which one won - rank 3 is a
+		// guess and the report needs to tell guesses apart from real matches.
+		ac2_ff::register_ps_diffuse_stage(shader, best,
+			(best >= 0) ? best_rank : -1, best_name.c_str());
+		ac2_lights::register_ps_lights(shader, num_omni, num_direct, num_spot, has_sun);
 	}
 
 	// -------------------------------------------------------------------------
@@ -648,10 +819,12 @@ namespace comp::ac2_dump
 			<< "\n";
 		f << "CPU skinning (F1)    : " << (ac2_ff::g_skinning ? "ON" : "off")
 			<< "   skinned draws: " << ac2_ff::g_skinned_draws << "\n";
-		f << "game anti-cull (DEL) : " << (ac2_ff::g_anticull
+		f << "game anti-cull        : " << (ac2_ff::g_anticull
 			? "ON - VisualsCulling gate + entity VISIBLE bit forced" : "off") << "\n";
 		f << "CullAABB (PAGE DOWN) : " << (ac2_ff::g_cullaabb
 			? "ON - always 'intersecting'" : "off") << "\n";
+		f << "occlusion off (PAGE UP): " << (ac2_ff::g_occlusion_off
+			? "ON - HW occlusion-query cull disabled (threshold 25 -> 0)" : "off") << "\n";
 		f << "const source (F12)   : " << (ac2_ff::g_use_const_shadow
 			? "OUR SHADOW (bridge-proof)" : "bridge GetVertexShaderConstantF") << "\n";
 		f << "engine View/Proj     : " << (ac2_ff::g_have_matrices()
@@ -661,7 +834,6 @@ namespace comp::ac2_dump
 		f << "max RELATIVE mvp err : " << ac2_ff::g_max_wvp_error
 			<< "   (<1e-6 = essentially exact)\n";
 		f << "World source         : " << ac2_ff::world_source_name() << "\n";
-		f << "depth bias (F3/F2)   : " << ac2_ff::g_depth_bias << "\n";
 
 		// ---- where do draws actually go? -------------------------------------
 		{
@@ -678,6 +850,8 @@ namespace comp::ac2_dump
 			f << "  ORTHO             : " << r.ortho << "   (decompose_vp: col3 ~ (0,0,0,1))\n";
 			f << "  bad_reconstruct   : " << r.bad_reconstruct << "   (decomposed but W*V*P != WVP)\n";
 			f << "  CONVERTED         : " << r.converted << "\n";
+			f << "    ..of which multi-stream : " << r.multistream
+				<< "   (POSITION not on stream 0, or attrs split across streams)\n";
 			f << "  -- skinned path --\n";
 			f << "    skin_seen       : " << r.skin_seen << "\n";
 			f << "    skin_no_diffuse : " << r.skin_no_diffuse << "\n";
@@ -689,6 +863,10 @@ namespace comp::ac2_dump
 			f << "    skin_OK         : " << r.skin_ok << "\n";
 		}
 		ac2_ff::dump_rejected_formats(f);
+		ac2_ff::dump_vs_coverage(f);
+		ac2_ff::dump_veg(f);
+		ac2_ff::dump_normal_only(f);
+		ac2_lights::dump(f);
 
 		// ---- skinning diagnostic: is the palette real, or identity? ----------
 		if (ac2_ff::g_skin_diag.valid)
@@ -715,6 +893,112 @@ namespace comp::ac2_dump
 				f << "\n";
 			}
 		}
+
+		// ---- texture/sampler diagnostic: why are we stuck on the lowest mip? --
+		{
+			const auto tex_filter_name = [](DWORD v) -> const char*
+			{
+				switch (v)
+				{
+				case D3DTEXF_NONE:            return "NONE";
+				case D3DTEXF_POINT:           return "POINT";
+				case D3DTEXF_LINEAR:          return "LINEAR";
+				case D3DTEXF_ANISOTROPIC:     return "ANISOTROPIC";
+				case D3DTEXF_PYRAMIDALQUAD:   return "PYRAMIDALQUAD";
+				case D3DTEXF_GAUSSIANQUAD:    return "GAUSSIANQUAD";
+				default:                      return "?";
+				}
+			};
+			const auto pool_name = [](DWORD p) -> const char*
+			{
+				switch (p)
+				{
+				case D3DPOOL_DEFAULT:   return "DEFAULT";
+				case D3DPOOL_MANAGED:   return "MANAGED";
+				case D3DPOOL_SYSTEMMEM: return "SYSTEMMEM";
+				case D3DPOOL_SCRATCH:   return "SCRATCH";
+				default:                return "?";
+				}
+			};
+			const auto put_samp = [&](const char* tag, const ac2_ff::tex_diag::samp& s)
+			{
+				f << "    " << tag
+					<< " MAXMIPLEVEL " << s.max_mip_level
+					<< " | MIPFILTER " << tex_filter_name(s.mip_filter)
+					<< " | LODBIAS " << s.mip_lod_bias
+					<< " | MIN " << tex_filter_name(s.min_filter)
+					<< " | MAG " << tex_filter_name(s.mag_filter) << "\n";
+			};
+
+			f << "\n---- TEXTURE/SAMPLER diagnostic (blurry-texture regression) ----\n";
+			f << "  Run 1 settled the original question: sampler states were IDENTICAL and\n";
+			f << "  GetLOD was 0 on a MANAGED texture, so nothing is clamping a mip. The\n";
+			f << "  bound textures were simply TINY at level 0 (8x8, 64x64). So the question\n";
+			f << "  is now: are we binding the WRONG SAMPLER? Read the stage table below -\n";
+			f << "  a big texture at a stage we passed over IS the answer.\n";
+
+			for (int i = 0; i < 2; ++i)
+			{
+				const auto& d = ac2_ff::g_tex_diag[i];
+				const char* what = (i == 0) ? "[stage==0: diffuse already at 0, we move NOTHING]"
+					: "[stage!=0: we move the texture to stage 0]";
+				f << "\n  " << what << "\n";
+				if (!d.valid)
+				{
+					// Not the same as "nothing wrong" - say so out loud.
+					f << "    NOT CAPTURED - no converted draw of this kind since the last arm.\n";
+					continue;
+				}
+				f << "    diffuse_stage : " << d.diffuse_stage
+					<< "   picked by rank " << d.rank
+					<< (d.rank == 3 ? " (GUESS - unrecognised name)" : "")
+					<< "   sampler '" << d.name << "'\n";
+				put_samp("src(diffuse_stage):", d.src);
+				put_samp("dst(stage 0)     :", d.dst);
+
+				const bool differs = d.src.max_mip_level != d.dst.max_mip_level
+					|| d.src.mip_filter != d.dst.mip_filter
+					|| d.src.mip_lod_bias != d.dst.mip_lod_bias
+					|| d.src.min_filter != d.dst.min_filter
+					|| d.src.mag_filter != d.dst.mag_filter;
+				f << "    SAMPLER STATES  : " << (differs ? "DIFFER  <- FF samples with the WRONG one"
+					: "identical") << "\n";
+
+				if (!d.have_tex)
+				{
+					f << "    texture         : NONE BOUND (!?)\n";
+					continue;
+				}
+				f << "    texture         : " << d.tex_width << "x" << d.tex_height
+					<< "  levels " << d.tex_levels
+					<< "  GetLOD " << d.tex_lod
+					<< "  pool " << pool_name(d.tex_pool)
+					<< "  fmt " << d.tex_format << "\n";
+				if (d.tex_pool != D3DPOOL_MANAGED)
+					f << "    (pool is not MANAGED => GetLOD is always 0 here; it proves nothing)\n";
+
+				// The decisive table. '<- WE PICKED THIS' next to an 8x8 while a
+				// 1024x1024 sits two rows down is the whole diagnosis.
+				// NB: do NOT read "biggest texture wins" into this table. s7 is
+				// g_ReflectionSampler and is a 512x288 render target - it is the
+				// largest bound texture on many draws and is never the diffuse.
+				// An earlier version flagged exactly that as "the matcher chose
+				// wrong" and was simply wrong itself.
+				f << "    all stages the GAME had bound at this draw:\n";
+				for (int s = 0; s < 8; ++s)
+				{
+					const auto& st = d.stages[s];
+					if (!st.bound) continue;
+					f << "      s" << s << ": " << st.width << "x" << st.height
+						<< "  levels " << st.levels << "  fmt " << st.format;
+					if (s == d.diffuse_stage) f << "   <- WE PICKED THIS";
+					f << "\n";
+				}
+			}
+
+			ac2_ff::dump_diffuse_sizes(f);
+		}
+		ac2_ff::dump_cache_diag(f);
 
 		// ---- texture lifecycle (Remix hash stability) ------------------------
 		f << "\n---- textures (Remix hash stability) ----\n";

@@ -19,6 +19,9 @@ constexpr auto COMP_MOD_VERSION_PATCH = 1;
 #include <filesystem>
 #include <cassert>
 #include <map>
+#include <vector>
+#include <algorithm>
+#include <iomanip>
 #include <set>
 #include <unordered_set>
 #include <fstream>

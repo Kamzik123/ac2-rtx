@@ -4,6 +4,7 @@
 #include "imgui.hpp"
 #include "ac2_dump.hpp"
 #include "ac2_ff.hpp"
+#include "ac2_lights.hpp"
 
 namespace comp
 {
@@ -134,6 +135,11 @@ namespace comp
 		// Sample this draw's actual vertices (BaseVertexIndex + MinVertexIndex -
 		// AC2 packs many meshes per VB). F8/F10 flushes, F9 toggles sampling.
 		ac2_dump::on_draw_indexed_prim(dev, BaseVertexIndex, MinVertexIndex, NumVertices);
+
+		// Harvest this draw's light set from the pixel-shader constants. Must run
+		// BEFORE the FF conversion below: that path swaps the pixel shader out, and
+		// the bound PS is what tells us how many lights the draw actually uses.
+		ac2_lights::on_draw(dev);
 
 		// Fixed-function conversion for generic static meshes (F7 toggles, F6 wireframe).
 		// If it handles the draw, do not let the game issue it again.

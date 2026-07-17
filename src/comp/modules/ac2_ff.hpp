@@ -53,8 +53,12 @@ namespace comp::ac2_ff
 	extern bool g_skinning;
 	extern std::uint32_t g_skinned_draws;
 
-	// Game-side anti-culling. DEFAULT ON (applied on the first draw); DELETE
-	// toggles it OFF.
+	// Game-side anti-culling. ALWAYS ON (applied on the first draw).
+	//
+	// The DELETE toggle was removed - the key was needed elsewhere and it had not
+	// been used in a long time. set_anticulling() is kept, so anyone wanting to A/B
+	// the patch can call it; the report still prints whether it is applied, and
+	// dump_patch_status() still prints the live bytes at each site.
 	//
 	// Remix's own rtx.antiCulling.* can only extend the life of objects the game
 	// still SUBMITS. AC2 frustum-culls before submission, so Remix never sees the
@@ -90,6 +94,26 @@ namespace comp::ac2_ff
 	// crashes. See the comment in ac2_ff.cpp before changing this.
 	extern bool g_cullaabb;
 	void set_cullaabb(bool enable);
+
+	// Hardware OCCLUSION culling disabled by zeroing the visible-pixel threshold
+	// (dword_1DD1828, normally 25). PAGE UP toggles; DEFAULT ON.
+	//
+	// THIS IS THE CULLING SYSTEM THAT ACTUALLY MATTERED. Turning it off brings the
+	// missing objects back on its own, and makes the CullAABB patch (PAGE DOWN)
+	// unnecessary - which is a straight win, because CullAABB is the one that
+	// crashes during loading. Prefer this; leave CullAABB off.
+	//
+	// This is a SEPARATE system from the frustum culling above: AC2 issues real D3D9
+	// occlusion queries and then drops the draw for objects showing fewer than 25
+	// pixels, BEFORE submission - so Remix never sees anything the game thinks is
+	// occluded (behind a building, inside geometry). That is the classic path-tracer
+	// failure mode and rtx.antiCulling.* cannot reach it.
+	//
+	// It is a data write, so unlike the CullAABB patch it carries no torn-byte risk.
+	// See the long comment at the patch site before changing the site or polarity -
+	// the branch semantics are inverted from the intuitive reading.
+	extern bool g_occlusion_off;
+	void set_occlusion_disabled(bool enable);
 
 	// Prints module base + the ACTUAL bytes at every patch site. A patch whose
 	// memcmp guard misses is a silent no-op, which looks identical to "applied but
@@ -165,10 +189,77 @@ namespace comp::ac2_ff
 	extern skin_diag g_skin_diag;
 	void arm_skin_diagnostic();
 
+	// ---- texture / sampler diagnostic ------------------------------------
+	// Textures render at their LOWEST MIP through the FF path (F7 off => sharp,
+	// so it is ours). The leading suspect is that we move the diffuse TEXTURE
+	// from its stage to stage 0 but leave stage 0's SAMPLER STATE as the game
+	// set it for its own stage-0 texture - a clamp upstream of anything Remix
+	// can bias.
+	//
+	// DO NOT theorise further on this; a cycle was already burned that way.
+	// These are the numbers that separate the three candidate fixes:
+	//   sampler clamp   -> MAXMIPLEVEL/MIPFILTER differ between the two stages
+	//   texture LOD     -> tex_lod > 0 (game-side streaming, a DIFFERENT problem)
+	//   neither         -> look elsewhere
+	//
+	// Two snapshots are captured, and the PAIR is the actual experiment:
+	//   [0] a draw whose diffuse already sits at stage 0 (we move nothing)
+	//   [1] a draw whose diffuse sits elsewhere (we move the texture, not the state)
+	// If only [1] is clamped, the sampler move is the bug. If [0] is clamped too,
+	// the sampler theory is DEAD - the cause is common to every converted draw.
+	struct tex_diag
+	{
+		bool  valid = false;
+		int   diffuse_stage = -1;
+
+		// Sampler state as the GAME left it, read live on a real converted draw.
+		// src = the stage the diffuse actually lives on; dst = stage 0, where FF
+		// samples from. Equal on snapshot [0] by definition.
+		struct samp
+		{
+			DWORD max_mip_level = 0;   // D3DSAMP_MAXMIPLEVEL: >0 CLAMPS to a coarser mip
+			DWORD mip_filter = 0;      // D3DSAMP_MIPFILTER: NONE => mip 0 only, no chain
+			float mip_lod_bias = 0.0f; // D3DSAMP_MIPMAPLODBIAS (stored as a float bitpattern)
+			DWORD min_filter = 0;
+			DWORD mag_filter = 0;
+		};
+		samp src{};   // sampler on diffuse_stage
+		samp dst{};   // sampler on stage 0
+
+		// The diffuse texture itself. GetLOD() is only meaningful for MANAGED
+		// textures (it returns 0 for every other pool), so the pool is printed
+		// alongside it - otherwise "lod 0" reads as proof of nothing.
+		bool  have_tex = false;
+		DWORD tex_lod = 0;         // GetLOD(): most detailed mip the GAME allows
+		DWORD tex_levels = 0;      // GetLevelCount(): mips that exist
+		UINT  tex_width = 0;       // level 0 dimensions - a tiny level 0 means
+		UINT  tex_height = 0;      // the sharp mips were never uploaded (streaming)
+		DWORD tex_pool = 0;
+		DWORD tex_format = 0;
+
+		// How the stage was picked, so a bad choice is visible as a bad choice.
+		int  rank = -1;
+		char name[64]{};
+
+		// EVERY stage the game had bound at this draw. The point: if a 1024x1024
+		// sits at a stage we passed over while we bound an 8x8, we picked wrong -
+		// and that is visible here without any further theorising.
+		struct stage_tex
+		{
+			bool  bound = false;
+			UINT  width = 0;
+			UINT  height = 0;
+			DWORD levels = 0;
+			DWORD format = 0;
+		};
+		stage_tex stages[8]{};
+	};
+	extern tex_diag g_tex_diag[2];   // [0] stage==0 draw, [1] stage!=0 draw
+	void arm_tex_diagnostic();
+
 	// F3/F2 nudge this. Even with exact matrices FF concatenates W*V*P itself
 	// while the game's shader uses a pre-multiplied WVP; they differ by ~1 ULP,
 	// enough to z-fight coplanar decals we don't convert.
-	extern float g_depth_bias;
 
 	// stats for the on-screen/report side
 	extern std::uint32_t g_converted_draws;
@@ -188,6 +279,13 @@ namespace comp::ac2_ff
 		std::uint32_t ortho = 0;        // decompose_vp said the pass is orthographic
 		std::uint32_t bad_reconstruct = 0; // decomposed but W*V*P != WVP
 		std::uint32_t converted = 0;
+
+		// Draws whose declaration spreads POSITION/NORMAL/TEXCOORD across more than
+		// one stream (or puts POSITION somewhere other than stream 0). These used to
+		// be rejected as not_static and - in FF-ONLY mode - deleted outright, which
+		// looked like a culling bug. Counted separately because they take the slower
+		// per-draw gather path instead of the cached shadow VB.
+		std::uint32_t multistream = 0;
 
 		// Skinned path: 112k draws match the character declaration but still end up
 		// in not_static, i.e. try_render_skinned() is bailing. Find out where.
@@ -222,8 +320,163 @@ namespace comp::ac2_ff
 	// ac2_dump parses each PS constant table at creation and registers the stage
 	// here; a PS with no diffuse registers -1 and we then refuse to convert that
 	// draw, which is what keeps AO/lighting passes out of the FF path.
-	void register_ps_diffuse_stage(IDirect3DPixelShader9* ps, int stage);
+	// How the diffuse stage was CHOSEN, not just which one won. The matcher ranks
+	// 0 = name contains "diffuse", 1 = "basetexture", 2 = "layer0",
+	// 3 = UNRECOGNISED - a guess ("lowest sampler that isn't provably wrong").
+	// Rank 3 exists because AC2's material editor emits procedural sampler names
+	// (Operator6_0, ...) and rejecting them cost 49% of draws. But a guess can
+	// land on a detail/mask sampler, and then we bind an 8x8 texture and stretch
+	// it over a wall - which reads as "blurry", not as "wrong texture".
+	// Keeping the rank lets the report separate the two populations.
+	// Rank 4 = NORMAL-ONLY material: the PS has no diffuse sampler at ANY stage,
+	// but it does have a normal map. That is not a lighting/AO pass - it is a real
+	// surface that genuinely has no albedo. AC2's water is exactly this:
+	// `NormalMap_0@s0` + `g_DepthSampler@s8` (+ reflection/projector), and nothing
+	// else. The matcher used to return -1 for it, so every water draw was refused
+	// as `no_diffuse` and FF-ONLY mode deleted the water from the scene.
+	//
+	// Only 33 of the game's 1362 pixel shaders match, across 3 templates:
+	// AC2_VolumeFog_DO_NOT_USE (20), AC2_Water_DO_NOT_USE (11) and
+	// AC1_GFX_Water_Puddle (2). The other 109 no-diffuse shaders have no normal map
+	// either and stay refused - they are the genuine AO/depth passes.
+	//
+	// > Water and VolumeFog are INDISTINGUISHABLE by sampler signature - identical
+	// > down to the register. They are the same shader family (fog is a water-derived
+	// > template); only their non-sampler constants differ (fog declares
+	// > `WaterOpacity_*`/`DepthFadeControl_*`, water declares `g_PickingID`). We
+	// > deliberately do NOT try to tell them apart here: Remix categorises by TEXTURE
+	// > HASH, and their normal maps are different textures, so they can be tagged
+	// > independently in `rtx.conf` (water -> `rtx.animatedWaterTextures`, fog ->
+	// > whatever suits). Letting both through with a hashable texture is what makes
+	// > that possible; deciding here would only take the choice away.
+	//
+	// The bound texture is the NORMAL MAP, used purely as an identity for Remix to
+	// hash - NOT as a normal map. Remix's legacy material has no normal slot at all
+	// (see "Open problems"), so its blue-ish pixels become the albedo until a
+	// replacement material is authored. That is the accepted cost of getting water
+	// geometry into the path tracer.
+	struct ps_diffuse_info
+	{
+		int  stage = -1;
+		int  rank = -1;      // -1 = never registered
+		char name[64]{};     // the winning sampler's name
+		bool normal_only = false;
+	};
+
+	// Convert normal-only (water/fog) materials. Default ON; F2 toggles.
+	extern bool g_normal_only_materials;
+	extern std::uint32_t g_normal_only_draws;
+	void register_ps_diffuse_stage(IDirect3DPixelShader9* ps, int stage,
+		int rank = -1, const char* name = nullptr, bool normal_only = false);
 	int  get_ps_diffuse_stage(IDirect3DPixelShader9* ps); // -1 = unknown / none
+	ps_diffuse_info get_ps_diffuse_info(IDirect3DPixelShader9* ps);
+
+	// Level-0 width of the diffuse we actually bind, histogrammed over EVERY
+	// converted draw and SPLIT BY RANK. Two arbitrary draws showing an 8x8
+	// texture proves nothing on its own; this says whether tiny textures are
+	// typical, and whether they track the GUESSED rank-3 matches specifically.
+	// If rank 0 binds 512/1024 and rank 3 binds 8/64, the matcher is the bug.
+	// If both are tiny, the matcher is exonerated - look elsewhere.
+	struct diffuse_size_stats
+	{
+		// buckets by level-0 width: <=8, <=32, <=64, <=128, <=256, <=512, >512
+		static constexpr int NBUCKET = 7;
+		std::uint32_t by_rank[6][NBUCKET]{};  // [rank 0..4, 5 = unregistered][bucket]
+		std::uint32_t rank_total[6]{};
+	};
+	extern diffuse_size_stats g_diffuse_sizes;
+	void dump_diffuse_sizes(std::ostream& os);
+
+	// ---- vegetation (RealTree / DistanceClutter) ----------------------------
+	// 141 of the game's 5642 vertex shaders declare NO dcl_position at all: the
+	// geometry is generated procedurally in the VS from a compressed skeleton.
+	// classify() therefore rejects them as not_static, and in FF-ONLY mode that
+	// DELETES every tree from the scene (~1.6M draws/run).
+	//
+	// The marker is exact, and was measured across the whole asset set rather
+	// than assumed: the 141 shaders with no dcl_position are EXACTLY the 141
+	// that declare `CompressionParams` (c120). Zero exceptions either way.
+	//
+	// They are NOT one shared vertex path - they split 47/47/47 into three
+	// families with genuinely different geometry generation:
+	//   trunk   - `TrunkStencil` (c150x56): a swept cylinder around a skeleton
+	//   leaves  - `LeavesEquations` (c214x6): camera-facing billboards
+	//   clutter - neither: rotated grass blades, base position on TEXCOORD9
+	// The family is recovered from the VS constant table at CreateVertexShader,
+	// exactly like the PS diffuse stage and the PS light counts - a draw-time
+	// guess is not possible and not needed.
+	//
+	// Base position is TEXCOORD4 for trunk/leaves but TEXCOORD9 for clutter, and
+	// the REGISTER carrying it varies (v3/v4/v6/v8) across variants. Select it by
+	// SEMANTIC. (An earlier note recorded "position = v3 = TEXCOORD4" from one
+	// sample; that is only true of the two families that happen to be live.)
+	//
+	// Only trunk and leaves appear at runtime: the two vegetation declarations in
+	// the report carry [s1 SHORT4N TEXCOORD4] and no TEXCOORD9/10, and they occur
+	// an IDENTICAL number of times (797,960 each) - one trunk draw and one leaves
+	// draw per tree.
+	enum class veg_kind : int
+	{
+		none = 0,     // not a vegetation shader (has a real dcl_position)
+		trunk,        // TrunkStencil
+		leaves,       // LeavesEquations
+		clutter,      // CompressionParams but neither: grass, TEXCOORD9 base
+	};
+	void     register_vs_info(IDirect3DVertexShader9* vs, veg_kind kind, std::uint32_t hash);
+	veg_kind get_vs_veg(IDirect3DVertexShader9* vs);
+
+	// ---- per-shader coverage --------------------------------------------
+	// "Is anything still missing?" cannot be answered from the totals: no_diffuse
+	// is ~45% of all draws and is MOSTLY CORRECT (depth/shadow/AO passes that must
+	// not be path-traced). Water hid inside that counter for the entire project -
+	// a real surface, invisible, and indistinguishable from a legitimate rejection.
+	//
+	// So account for every draw's outcome PER VERTEX SHADER instead. A shader with
+	// many draws and 0% converted is the signature of something missing, and it
+	// surfaces without anyone having to walk past it.
+	//
+	// The bytecode hash makes the table nameable offline: live dumps are
+	// byte-identical to the MaterialTemplate assets, so an FNV-1a 32 of each asset
+	// .dxbc maps a hash back to a template name. See tools/name_live_shaders.py.
+	void dump_vs_coverage(std::ostream& os);
+
+	// Convert trunk draws on the CPU. Toggled so a trunk-shaped bug can be told
+	// apart from the rest of the FF path with one keypress, the way INSERT
+	// separates "can't convert" from "doesn't exist".
+	extern bool g_veg_trunks;
+	extern bool g_veg_leaves;
+
+	// Per-family draw accounting, so "vegetation still missing" can be told apart
+	// from "we never saw a trunk draw". Every bail-out on this path increments
+	// something: a silent early-return is indistinguishable from "nothing found".
+	struct veg_stats
+	{
+		std::uint32_t seen[4]{};        // indexed by veg_kind
+		std::uint32_t trunk_converted = 0;
+		std::uint32_t trunk_no_decl = 0;    // no TEXCOORD4/5/2/1 of the right type
+		std::uint32_t trunk_no_const = 0;   // a required constant was never uploaded
+		std::uint32_t trunk_no_diffuse = 0;
+		std::uint32_t trunk_no_vb = 0;
+		std::uint32_t trunk_no_camera = 0;
+		std::uint32_t stencil_clamped = 0;  // stencil index outside [0,55]
+
+		std::uint32_t leaf_converted = 0;
+		std::uint32_t leaf_no_decl = 0;
+		std::uint32_t leaf_no_const = 0;
+		std::uint32_t leaf_no_diffuse = 0;
+		std::uint32_t leaf_no_vb = 0;
+		std::uint32_t leaf_no_camera = 0;
+		std::uint32_t leaf_eq_clamped = 0;  // LeavesEquations index outside [0,6)
+	};
+	extern veg_stats g_veg;
+	void dump_veg(std::ostream& os);
+	void dump_normal_only(std::ostream& os);
+
+	// Is the shadow-VB cache serving wrong geometry, and can the dynamic pool
+	// actually race? Both are open suspects for "faces randomly disappear";
+	// both are measured rather than assumed. See ac2_ff.cpp for what each counter
+	// distinguishes.
+	void dump_cache_diag(std::ostream& os);
 
 	// Returns true if the draw was fully handled (caller must NOT draw again).
 	bool try_render_fixed_function(IDirect3DDevice9* dev,

@@ -33,7 +33,9 @@ namespace comp::ac2_dump
 
 	// Hook: IDirect3DDevice9::CreateVertexShader.
 	// Dumps bytecode (.cso), disassembly + constant table (.asm). Deduped by hash.
-	void on_create_vertex_shader(const DWORD* pFunction);
+	// `shader` may be null (creation failed); it is used to register the shader's
+	// vegetation family, so this must be called AFTER the real CreateVertexShader.
+	void on_create_vertex_shader(const DWORD* pFunction, IDirect3DVertexShader9* shader);
 
 	// Hook: IDirect3DDevice9::CreatePixelShader (call AFTER the real create, so
 	// the shader pointer exists). Dumps like the VS path, and additionally works

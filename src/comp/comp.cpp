@@ -82,7 +82,17 @@ namespace comp
 	{
 		// #Step 2: init remix api if you want to use it or comment it otherwise
 		// Requires "exposeRemixApi = True" in the "bridge.conf" that is located in the .trex folder
-		shared::common::remix_api::initialize(nullptr, nullptr, nullptr, false);
+		//
+		// NOT INITIALISED HERE. main() runs at ASI load time, which is too early:
+		// bridge_initRemixApi() resolves remixapi_InitializeLibrary out of d3d9.dll,
+		// and initialize() then calls init_debug_lines(), which creates Remix meshes
+		// and materials before a D3D9 device exists. While bridge.conf was absent the
+		// init simply FAILED and the whole path stayed dead - which is exactly why
+		// the mod created zero lights. Adding bridge.conf made the init succeed at
+		// load time and it crashed at startup.
+		//
+		// So defer it to the first draw, which guarantees both d3d9.dll and the device
+		// are up. See ac2_lights::ensure_remix_api().
 
 		// init modules which do not need to be initialized, before the game inits, here
 		shared::common::loader::module_loader::register_module(std::make_unique<imgui>());

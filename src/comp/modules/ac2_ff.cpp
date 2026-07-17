@@ -9,6 +9,10 @@ namespace comp::ac2_ff
 	bool g_wireframe = false;
 	bool g_ff_only = true;   // INSERT toggles OFF; default ON
 	bool g_skinning = true;
+	bool g_veg_trunks = true;
+	bool g_veg_leaves = true;
+	bool g_normal_only_materials = true;
+	std::uint32_t g_normal_only_draws = 0;
 	std::uint32_t g_skinned_draws = 0;
 	bool g_anticull = false;
 	bool g_use_const_shadow = true;
@@ -159,6 +163,43 @@ namespace comp::ac2_ff
 	};
 	bool g_cullaabb = false;
 
+	// ---- hardware OCCLUSION culling -> disabled. END, default OFF. ------------
+	// A SECOND, independent culling system, separate from the frustum work above.
+	// scimitar::OGLBaseRenderer::RenderElements (0x1202950) runs two passes:
+	//   a6 == 1 : issue the occlusion queries (sub_12679F0 / sub_1267A20)
+	//   a6 == 2 : consume the results and DROP the draw if too few pixels showed
+	//
+	//   1202a81  call sub_1267A60          ; GetVisiblePixels()
+	//   1202a90  cmp  eax, dword_1DD1828   ; the threshold, = 25
+	//   1202a96  jnb  short 1202ae1        ; >= 25 -> RENDER
+	//                                      ; fall through -> CULLED
+	//
+	// The cull path skips the draw call at 0x1202c30 (sub_1270D70) entirely, so an
+	// occluded object NEVER REACHES D3D9 and Remix cannot see it. rtx.antiCulling.*
+	// is powerless here for the same reason it is powerless against frustum culling:
+	// it can only extend the life of objects the game still submits.
+	//
+	// VERIFIED FROM THE DECOMPILATION, not from the mnemonic: `jnb` TAKEN means
+	// render; FALL-THROUGH means culled. So the intuitive "NOP the branch" fix would
+	// cull EVERYTHING - the same inversion that has bitten this project twice.
+	//
+	// Patch the THRESHOLD instead of the branch. The compare is unsigned, so a
+	// threshold of 0 makes `eax < 0` impossible => the cull never fires. Two reasons
+	// this is the better site:
+	//   - It is a DATA write, not a code write. No torn-byte hazard in a hot function
+	//     that job threads are inside - which is exactly what crashed the CullAABB
+	//     prologue patch.
+	//   - dword_1DD1828 has exactly ONE reader (this compare), so there are no
+	//     side effects elsewhere.
+	//
+	// Blast radius is naturally small: the gate only applies to objects that opted in
+	// via (*(a4+171) & 1), and GetVisiblePixels already returns 1000 ("assume
+	// visible") when an object has no query, so the no-query fallback renders anyway.
+	static const code_patch s_occlusion_patch[] = {
+		{ 0x1dd1828, { 0x19, 0x00, 0x00, 0x00 }, { 0x00, 0x00, 0x00, 0x00 }, 4 },
+	};
+	bool g_occlusion_off = false;
+
 	static void apply_patches(const code_patch* first, size_t count, bool enable, bool& flag)
 	{
 		const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
@@ -193,6 +234,11 @@ namespace comp::ac2_ff
 	void set_cullaabb(bool enable)
 	{
 		apply_patches(s_cullaabb_patch, std::size(s_cullaabb_patch), enable, g_cullaabb);
+	}
+
+	void set_occlusion_disabled(bool enable)
+	{
+		apply_patches(s_occlusion_patch, std::size(s_occlusion_patch), enable, g_occlusion_off);
 	}
 
 	// Patch sites silently no-op when the memcmp guard misses, which is
@@ -233,13 +279,13 @@ namespace comp::ac2_ff
 		os << "\n---- code patch sites (actual bytes in memory) ----\n";
 		os << "  module base: 0x" << std::hex
 		   << reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr)) << std::dec << "\n";
-		for (const auto& cp : s_cull_patches)    dump_one(os, cp, "DELETE  ");
-		for (const auto& cp : s_cullaabb_patch)  dump_one(os, cp, "PAGEDOWN");
+		for (const auto& cp : s_cull_patches)     dump_one(os, cp, "DELETE  ");
+		for (const auto& cp : s_cullaabb_patch)   dump_one(os, cp, "PAGEDOWN");
+		for (const auto& cp : s_occlusion_patch)  dump_one(os, cp, "PAGEUP  ");
 	}
 
 	bool g_stage_b = true;
 	float g_max_wvp_error = 0.0f;
-	float g_depth_bias = 0.0f;
 	world_src g_world_source = world_src::none;
 	diag_snapshot g_diag{};
 	static volatile bool s_diag_armed = true;
@@ -254,6 +300,48 @@ namespace comp::ac2_ff
 	// max_bone_index describes that draw and not whatever ran last.
 	static volatile bool s_skin_diag_capturing = false;
 	void arm_skin_diagnostic() { s_skin_diag_armed = true; }
+
+	// Two independent arms: a stage==0 draw and a stage!=0 draw are both needed
+	// before the pair means anything, and they arrive in whatever order the
+	// frame happens to submit them.
+	tex_diag g_tex_diag[2]{};
+	static volatile bool s_tex_diag_armed[2] = { true, true };
+	void arm_tex_diagnostic() { s_tex_diag_armed[0] = true; s_tex_diag_armed[1] = true; }
+
+	// Cumulative across the run - deliberately NOT reset by arming, because the
+	// whole point is a population big enough that no single draw sways it.
+	diffuse_size_stats g_diffuse_sizes{};
+
+	void dump_diffuse_sizes(std::ostream& os)
+	{
+		static const char* const BUCKET[diffuse_size_stats::NBUCKET] = {
+			"<=8", "<=32", "<=64", "<=128", "<=256", "<=512", ">512" };
+		static const char* const RANK[6] = {
+			"0 name has 'diffuse' ", "1 'basetexture'      ", "2 'layer0'           ",
+			"3 GUESS (unrecognised)", "4 NORMAL-ONLY (water)", "5 never registered   " };
+
+		os << "\n---- diffuse level-0 WIDTH by matcher rank (all converted draws) ----\n";
+		os << "  Rank 3 is a GUESS: 'lowest sampler not provably wrong'. If rank 0 is big\n";
+		os << "  and rank 3 is tiny, we are binding detail/mask maps on the guessed ones.\n";
+		os << "  rank                    total";
+		for (int b = 0; b < diffuse_size_stats::NBUCKET; ++b) os << "  " << BUCKET[b];
+		os << "\n";
+		os << "  Rank 4 is water/volume fog: no albedo exists, so the bound texture is the\n";
+		os << "  NORMAL MAP, present only to give Remix something to hash and categorise.\n";
+		for (int r = 0; r < 6; ++r)
+		{
+			if (!g_diffuse_sizes.rank_total[r]) continue;
+			os << "  " << RANK[r] << " " << g_diffuse_sizes.rank_total[r];
+			for (int b = 0; b < diffuse_size_stats::NBUCKET; ++b)
+			{
+				const std::uint32_t n = g_diffuse_sizes.by_rank[r][b];
+				const double pct = 100.0 * n / g_diffuse_sizes.rank_total[r];
+				os << "   " << n << "(" << static_cast<int>(pct + 0.5) << "%)";
+			}
+			os << "\n";
+		}
+	}
+
 	std::uint32_t g_converted_draws = 0;
 	std::uint32_t g_shadow_vbs = 0;
 	reject_stats g_rej{};
@@ -464,13 +552,78 @@ namespace comp::ac2_ff
 			float u, v;         // SHORT2N -> float
 		};
 		constexpr DWORD FF_FVF = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1;
+
+		// SHORT2N TEXCOORD0 -> real UV.
+		//
+		// D3D normalizes SHORT2N to short/32767, and AC2's vertex shaders then
+		// scale that by a literal 16 before writing the UV output. Verified in the
+		// disassembly for BOTH paths we convert:
+		//   static  (VertexShader_..._0x0B6C41CD70642B52, SHORT4 position):
+		//       def c5, 16, 0, 0, 0
+		//       mul o2, c5.xxyy, v1.xyxx      ; uv = 16 * v1.xy
+		//   skinned (VertexShader_Characters-Skin_0x05101CD460392E08_...):
+		//       def c5, 3, 16, 0, 1          ; x = bone stride, y = 16
+		//       mul o1, c5.yyzz, v3.xyxx      ; uv = 16 * v3.xy
+		// Across the assets, every SHORT4-static VS that samples a diffuse uses
+		// 16 (889 of them) and NONE uses 1 - the scale-1 shaders are FLOAT2-UV
+		// variants, which take the uv_float2 path below and must NOT be scaled.
+		//
+		// Net: uv = short * 16/32767, i.e. the "2048 quantization scale"
+		// (32768/16 = 2048). We previously stopped at short/32767, making every
+		// UV 16x too small: the texture was magnified 16x, which looks SOFT and
+		// was long mistaken for a mip/LOD clamp. It never was - sampler state and
+		// GetLOD were measured clean.
+		//
+		// The 16 is a literal in the shader, not an uploaded constant, so there is
+		// nothing per-draw to read back; it is genuinely a constant of the format.
+		constexpr float UV_SHORT2N_SCALE = 16.0f / 32767.0f;
 		static_assert(sizeof(ff_vertex) == 32, "ff_vertex must be 32 bytes");
 
 		struct shadow_vb
 		{
 			IDirect3DVertexBuffer9* vb = nullptr;
 			UINT vertex_count = 0;
+
+			// ---- staleness / mismatch detection (diagnostic) ------------------
+			// The cache is keyed ONLY on the source VB pointer, but the conversion
+			// also depends on the STRIDE and the DECLARATION, and on the source
+			// CONTENTS at build time. Two ways that can silently serve wrong
+			// geometry, both of which look like "faces randomly disappear":
+			//   1. same VB drawn with a different decl/stride -> we hand back a
+			//      copy decoded with the wrong layout
+			//   2. the game re-fills a MANAGED VB (streaming) -> our copy is frozen
+			//      at the old contents. is_dynamic_vb() only bypasses DYNAMIC /
+			//      D3DPOOL_DEFAULT, so a re-filled MANAGED buffer slips through.
+			//      This is the cloth "static VB" lesson wearing a second costume.
+			UINT stride = 0;
+			std::uint64_t decl_fp = 0;   // fingerprint of the decl it was built with
+			std::uint64_t src_hash = 0;  // checksum of the source bytes at build time
+			UINT src_bytes = 0;
 		};
+
+		// Cheap order-dependent checksum. Not cryptographic - it only has to notice
+		// that a buffer's contents changed.
+		std::uint64_t hash_bytes(const void* p, std::size_t n)
+		{
+			const auto* b = static_cast<const std::uint8_t*>(p);
+			std::uint64_t h = 1469598103934665603ull;          // FNV-1a
+			for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+			return h;
+		}
+
+		// How much of the source we checksum. Full-buffer hashing every hit would
+		// cost more than the conversion it guards; the head of the buffer is enough
+		// to notice a re-fill.
+		constexpr UINT SRC_HASH_BYTES = 256;
+
+		struct cache_diag
+		{
+			std::uint32_t hits = 0;
+			std::uint32_t decl_mismatch = 0;   // >0 => key is missing decl/stride
+			std::uint32_t stale_checked = 0;
+			std::uint32_t stale_found = 0;     // >0 => source was re-filled under us
+		};
+		cache_diag g_cache_diag{};
 
 		std::mutex s_mutex;
 		// keyed by source VB pointer (we AddRef the source to keep the key valid)
@@ -478,20 +631,73 @@ namespace comp::ac2_ff
 		// per-draw |w|, keyed by (source VB, first vertex)
 		std::map<std::pair<IDirect3DVertexBuffer9*, UINT>, float> s_scale;
 		// pixel shader -> diffuse texture stage (-1 = none identified)
-		std::map<IDirect3DPixelShader9*, int> s_ps_diffuse;
+		std::map<IDirect3DPixelShader9*, ps_diffuse_info> s_ps_diffuse;
+		// vertex shader -> family + bytecode hash + per-shader draw accounting
+		// (AddRef'd, like s_ps_diffuse: D3D recycles the addresses of released
+		// objects)
+		struct vs_info
+		{
+			veg_kind      kind = veg_kind::none;
+			std::uint32_t hash = 0;
+			std::uint32_t seen = 0;
+			std::uint32_t converted = 0;
+		};
+		std::map<IDirect3DVertexShader9*, vs_info> s_vs_veg;
+
+		// AC2 only ever uses stream 0 and 1, but bound the array anyway - classify()
+		// rejects a declaration that reaches past this so the rest of the code can
+		// index the stream arrays without re-checking.
+		constexpr UINT MAX_STREAMS = 4;
+
+		// The locked source data for each stream a declaration actually uses.
+		// Attributes may live on different streams, so a vertex is GATHERED across
+		// streams rather than read from one flat record.
+		struct vtx_streams
+		{
+			const std::uint8_t* base[MAX_STREAMS]{};   // locked VB bytes + the stream's own offset
+			UINT                stride[MAX_STREAMS]{};
+		};
 
 		struct decl_info
 		{
 			bool  ok = false;
+			UINT  pos_stream = 0;
 			UINT  pos_off = 0;
 			bool  pos_float3 = false;  // FLOAT3 = uncompressed, no |w| scale
-			UINT  nrm_off = 0;  bool has_nrm = false;  bool nrm_float3 = false;
-			UINT  uv_off = 0;   bool has_uv = false;   bool uv_float2 = false;
+			UINT  nrm_stream = 0;  UINT nrm_off = 0;  bool has_nrm = false;  bool nrm_float3 = false;
+			UINT  uv_stream = 0;   UINT uv_off = 0;   bool has_uv = false;   bool uv_float2 = false;
+
+			// True when every attribute we use lives on stream 0. That's the case the
+			// cached shadow VB can serve (one source VB -> one converted VB, 1:1 by
+			// vertex index). Anything else has to be converted per-draw.
+			bool single_stream0 = false;
 		};
 
-		// We only take the generic static format: SHORT4 POSITION on stream 0.
-		// Skinned meshes (SHORT4N + BLENDINDICES) are deliberately excluded -
-		// they need bone handling that FF can't express the same way.
+		// Fingerprint the fields the conversion actually reads. If any differ from
+		// what a cached copy was decoded under, that copy is wrong for this draw.
+		std::uint64_t decl_fingerprint(const decl_info& d, UINT stride)
+		{
+			const std::uint32_t a[] = {
+				stride, d.pos_stream, d.pos_off, d.pos_float3,
+				d.nrm_stream, d.nrm_off, d.has_nrm, d.nrm_float3,
+				d.uv_stream, d.uv_off, d.has_uv, d.uv_float2, d.single_stream0
+			};
+			return hash_bytes(a, sizeof(a));
+		}
+
+		// Find the generic static format on WHATEVER STREAM it lives on.
+		//
+		// This used to hard-filter `if (e[i].Stream != 0) continue`, so a mesh with
+		// POSITION on stream 1 was rejected as "not_static" and never converted -
+		// which in FF-ONLY mode means DELETED FROM THE SCENE. That reads as a culling
+		// bug (objects missing) but is really a coverage bug, and it is why the
+		// rejected-format histogram appeared to show position-less declarations: the
+		// histogram was filtered to stream 0 too, so it printed the same blind spot
+		// that caused the rejection. Every runtime-dumped VS declares dcl_position,
+		// so POSITION is always SOMEWHERE in the declaration - go find it.
+		//
+		// Skinned meshes (BLENDINDICES/BLENDWEIGHT) are still excluded here; they are
+		// handled by the CPU-skinning path in try_render_skinned().
 		decl_info classify(const D3DVERTEXELEMENT9* e, UINT n)
 		{
 			decl_info d;
@@ -501,29 +707,59 @@ namespace comp::ac2_ff
 				if (e[i].Usage == D3DDECLUSAGE_BLENDINDICES
 					|| e[i].Usage == D3DDECLUSAGE_BLENDWEIGHT) skinned = true;
 
-				if (e[i].Stream != 0) continue;
 				switch (e[i].Usage)
 				{
 				case D3DDECLUSAGE_POSITION:
 					// SHORT4 = compressed (|w|/262136 folded into World).
-					// FLOAT3 = uncompressed, used as-is. ~43k draws/run are FLOAT3
-					// geometry we were silently dropping into vertex capture.
-					if (e[i].Type == D3DDECLTYPE_SHORT4) { d.pos_off = e[i].Offset; d.ok = true; d.pos_float3 = false; }
-					else if (e[i].Type == D3DDECLTYPE_FLOAT3) { d.pos_off = e[i].Offset; d.ok = true; d.pos_float3 = true; }
+					// FLOAT3 = uncompressed, used as-is.
+					// Only UsageIndex 0 is the real position.
+					if (e[i].UsageIndex != 0) break;
+					if (e[i].Type == D3DDECLTYPE_SHORT4)
+					{
+						d.pos_stream = e[i].Stream; d.pos_off = e[i].Offset; d.ok = true; d.pos_float3 = false;
+					}
+					else if (e[i].Type == D3DDECLTYPE_FLOAT3)
+					{
+						d.pos_stream = e[i].Stream; d.pos_off = e[i].Offset; d.ok = true; d.pos_float3 = true;
+					}
 					break;
 				case D3DDECLUSAGE_NORMAL:
-					if (e[i].Type == D3DDECLTYPE_UBYTE4) { d.nrm_off = e[i].Offset; d.has_nrm = true; d.nrm_float3 = false; }
-					else if (e[i].Type == D3DDECLTYPE_FLOAT3) { d.nrm_off = e[i].Offset; d.has_nrm = true; d.nrm_float3 = true; }
+					if (e[i].UsageIndex != 0) break;
+					if (e[i].Type == D3DDECLTYPE_UBYTE4)
+					{
+						d.nrm_stream = e[i].Stream; d.nrm_off = e[i].Offset; d.has_nrm = true; d.nrm_float3 = false;
+					}
+					else if (e[i].Type == D3DDECLTYPE_FLOAT3)
+					{
+						d.nrm_stream = e[i].Stream; d.nrm_off = e[i].Offset; d.has_nrm = true; d.nrm_float3 = true;
+					}
 					break;
 				case D3DDECLUSAGE_TEXCOORD:
 					if (e[i].UsageIndex != 0) break;
-					if (e[i].Type == D3DDECLTYPE_SHORT2N) { d.uv_off = e[i].Offset; d.has_uv = true; d.uv_float2 = false; }
-					else if (e[i].Type == D3DDECLTYPE_FLOAT2) { d.uv_off = e[i].Offset; d.has_uv = true; d.uv_float2 = true; }
+					if (e[i].Type == D3DDECLTYPE_SHORT2N)
+					{
+						d.uv_stream = e[i].Stream; d.uv_off = e[i].Offset; d.has_uv = true; d.uv_float2 = false;
+					}
+					else if (e[i].Type == D3DDECLTYPE_FLOAT2)
+					{
+						d.uv_stream = e[i].Stream; d.uv_off = e[i].Offset; d.has_uv = true; d.uv_float2 = true;
+					}
 					break;
 				default: break;
 				}
 			}
 			if (skinned) d.ok = false;
+
+			// with_streams()/decode_vertex() index the stream arrays unchecked, so a
+			// declaration reaching past MAX_STREAMS must be refused here, not there.
+			if (d.pos_stream >= MAX_STREAMS
+				|| (d.has_nrm && d.nrm_stream >= MAX_STREAMS)
+				|| (d.has_uv && d.uv_stream >= MAX_STREAMS)) d.ok = false;
+
+			d.single_stream0 = d.ok
+				&& d.pos_stream == 0
+				&& (!d.has_nrm || d.nrm_stream == 0)
+				&& (!d.has_uv || d.uv_stream == 0);
 			return d;
 		}
 
@@ -539,9 +775,11 @@ namespace comp::ac2_ff
 		}
 
 		// Convert one draw's vertices straight into a caller-provided buffer.
-		// Used for dynamic sources, where caching would freeze the geometry.
-		UINT convert_range(IDirect3DVertexBuffer9* src, UINT stride, const decl_info& di,
+		// Used for dynamic sources (caching would freeze them) and for multi-stream
+		// declarations (the shadow cache is keyed on a single source VB).
+		UINT convert_range(const vtx_streams& s, const decl_info& di,
 			UINT first, UINT count, ff_vertex* out);
+		void decode_vertex(const vtx_streams& s, UINT v, const decl_info& di, ff_vertex& o);
 
 		// Build (once) a float FVF copy of the whole source buffer.
 		shadow_vb* get_or_build_shadow(IDirect3DDevice9* dev, IDirect3DVertexBuffer9* src,
@@ -549,7 +787,30 @@ namespace comp::ac2_ff
 		{
 			std::lock_guard<std::mutex> lk(s_mutex);
 			auto it = s_shadow.find(src);
-			if (it != s_shadow.end()) return &it->second;
+			if (it != s_shadow.end())
+			{
+				// DIAGNOSTIC ONLY - deliberately still returns the cached copy, so
+				// this build measures the bug without also changing what renders.
+				// Fixing and measuring in the same build confounds both.
+				g_cache_diag.hits++;
+				if (it->second.decl_fp != decl_fingerprint(di, stride))
+					g_cache_diag.decl_mismatch++;
+
+				// Re-read the head of the source and compare. Sampled: locking the
+				// source on every hit would cost more than the cache saves.
+				if ((g_cache_diag.hits & 0x1FF) == 0 && it->second.src_bytes)
+				{
+					void* sd = nullptr;
+					if (SUCCEEDED(src->Lock(0, it->second.src_bytes, &sd, D3DLOCK_READONLY)) && sd)
+					{
+						const std::uint64_t now = hash_bytes(sd, it->second.src_bytes);
+						src->Unlock();
+						g_cache_diag.stale_checked++;
+						if (now != it->second.src_hash) g_cache_diag.stale_found++;
+					}
+				}
+				return &it->second;
+			}
 
 			D3DVERTEXBUFFER_DESC vd{};
 			if (FAILED(src->GetDesc(&vd)) || !stride) return nullptr;
@@ -574,66 +835,30 @@ namespace comp::ac2_ff
 				return nullptr;
 			}
 
-			const auto* sb = static_cast<const std::uint8_t*>(sdata);
+			// Only reached for single_stream0 declarations, so every attribute reads
+			// out of this one buffer. Build a vtx_streams that says exactly that and
+			// reuse the shared decoder rather than keeping a second copy of the
+			// conversion rules that can drift out of sync with it.
+			vtx_streams s{};
+			s.base[0] = static_cast<const std::uint8_t*>(sdata);
+			s.stride[0] = stride;
+
 			auto* out = static_cast<ff_vertex*>(ddata);
-
 			for (UINT i = 0; i < count; ++i)
-			{
-				const auto* p = sb + static_cast<std::size_t>(stride) * i;
-				ff_vertex& o = out[i];
+				decode_vertex(s, i, di, out[i]);
 
-				if (di.pos_float3)
-				{
-					float f[3];
-					memcpy(f, p + di.pos_off, sizeof(f));
-					o.x = f[0]; o.y = f[1]; o.z = f[2];
-				}
-				else
-				{
-					std::int16_t ps[4];
-					memcpy(ps, p + di.pos_off, sizeof(ps));
-					// raw shorts; the |w| scale is folded into World per draw
-					o.x = static_cast<float>(ps[0]);
-					o.y = static_cast<float>(ps[1]);
-					o.z = static_cast<float>(ps[2]);
-				}
-
-				if (di.has_nrm && di.nrm_float3)
-				{
-					float f[3];
-					memcpy(f, p + di.nrm_off, sizeof(f));
-					o.nx = f[0]; o.ny = f[1]; o.nz = f[2];
-				}
-				else if (di.has_nrm)
-				{
-					const std::uint8_t* nb = p + di.nrm_off;
-					o.nx = (static_cast<float>(nb[0]) - 127.0f) * (1.0f / 127.0f);
-					o.ny = (static_cast<float>(nb[1]) - 127.0f) * (1.0f / 127.0f);
-					o.nz = (static_cast<float>(nb[2]) - 127.0f) * (1.0f / 127.0f);
-				}
-				else { o.nx = 0.0f; o.ny = 1.0f; o.nz = 0.0f; }
-
-				if (di.has_uv && di.uv_float2)
-				{
-					float f[2];
-					memcpy(f, p + di.uv_off, sizeof(f));
-					o.u = f[0]; o.v = f[1];
-				}
-				else if (di.has_uv)
-				{
-					std::int16_t t[2];
-					memcpy(t, p + di.uv_off, sizeof(t));
-					o.u = static_cast<float>(t[0]) * (1.0f / 32767.0f);
-					o.v = static_cast<float>(t[1]) * (1.0f / 32767.0f);
-				}
-				else { o.u = 0.0f; o.v = 0.0f; }
-			}
+			// Checksum the source while it is still LOCKED - sdata is invalid after
+			// Unlock, and hashing it afterwards would read freed/remapped memory.
+			shadow_vb sv; sv.vb = dst; sv.vertex_count = count;
+			sv.stride = stride;
+			sv.decl_fp = decl_fingerprint(di, stride);
+			sv.src_bytes = (vd.Size < SRC_HASH_BYTES) ? vd.Size : SRC_HASH_BYTES;
+			sv.src_hash = hash_bytes(sdata, sv.src_bytes);
 
 			dst->Unlock();
 			src->Unlock();
 
 			src->AddRef(); // keep the key pointer alive
-			shadow_vb sv; sv.vb = dst; sv.vertex_count = count;
 			g_shadow_vbs++;
 			return &(s_shadow[src] = sv);
 		}
@@ -690,8 +915,29 @@ namespace comp::ac2_ff
 		std::vector<IDirect3DVertexBuffer9*> s_dyn_pool;
 		std::size_t s_dyn_next = 0;
 
+		// Which threads actually reach the dynamic pool? The pool is unlocked on a
+		// D3DCREATE_MULTITHREADED device, which reads as an obvious race - but AC2
+		// records on worker threads and PLAYS BACK on one render thread, and our
+		// hook sits on playback. If only one thread ever appears here, the race is
+		// impossible and a lock would be pure cost on a ~900k-draw path. Measure
+		// before locking.
+		std::uint32_t g_dyn_threads[4]{};
+		std::uint32_t g_dyn_thread_count = 0;
+		std::uint32_t g_dyn_thread_overflow = 0;
+
+		void note_dyn_thread()
+		{
+			const std::uint32_t id = GetCurrentThreadId();
+			for (std::uint32_t i = 0; i < g_dyn_thread_count; ++i)
+				if (g_dyn_threads[i] == id) return;
+			if (g_dyn_thread_count < 4) g_dyn_threads[g_dyn_thread_count++] = id;
+			else g_dyn_thread_overflow++;
+		}
+
 		IDirect3DVertexBuffer9* get_dynamic_vb(IDirect3DDevice9* dev, UINT bytes)
 		{
+			note_dyn_thread();
+
 			// Round-robin a small pool so we don't stall on a buffer still in flight.
 			constexpr std::size_t POOL = 64;
 			if (s_dyn_pool.size() < POOL) s_dyn_pool.resize(POOL, nullptr);
@@ -756,13 +1002,23 @@ namespace comp::ac2_ff
 			}
 		}
 
+		// Log EVERY stream, not just stream 0.
+		//
+		// This used to filter to `Stream != 0` - the same blind spot classify() had.
+		// A mesh whose POSITION lives on stream 1 was rejected by classify() (which
+		// never looked past stream 0) and then printed here MINUS its position
+		// element, so the report showed it as an all-TEXCOORD declaration with no
+		// position at all. That is a measurement artefact, and it sent us hunting for
+		// an exotic "RealTree vertex format" that may not exist: every one of the 184
+		// vertex shaders dumped at runtime declares dcl_position, so D3D *must* be
+		// feeding POSITION from somewhere in the declaration.
 		void note_rejected(const D3DVERTEXELEMENT9* e, UINT n)
 		{
 			std::string s;
 			for (UINT i = 0; i < n && e[i].Stream != 0xFF; ++i)
 			{
-				if (e[i].Stream != 0) continue;
-				s += "[+" + std::to_string(e[i].Offset) + " " + dtype_name(e[i].Type)
+				s += "[s" + std::to_string(e[i].Stream)
+					+ " +" + std::to_string(e[i].Offset) + " " + dtype_name(e[i].Type)
 					+ " " + dusage_name(e[i].Usage) + std::to_string(e[i].UsageIndex) + "]";
 			}
 			if (s.empty()) return;
@@ -806,18 +1062,24 @@ namespace comp::ac2_ff
 			return true;
 		}
 
-		// Shared decode: one source vertex -> one ff_vertex. (Same conversions the
-		// cached shadow builder uses; factored out so the dynamic path can reuse it.)
-		void decode_vertex(const std::uint8_t* p, const decl_info& di, ff_vertex& o)
+		// Shared decode: source vertex `v` -> one ff_vertex. Each attribute is fetched
+		// from its own stream, so a declaration that splits POSITION and TEXCOORD
+		// across two vertex buffers decodes correctly.
+		void decode_vertex(const vtx_streams& s, UINT v, const decl_info& di, ff_vertex& o)
 		{
+			auto at = [&](UINT stream, UINT off) {
+				return s.base[stream] + static_cast<std::size_t>(s.stride[stream]) * v + off;
+			};
+
+			const std::uint8_t* pp = at(di.pos_stream, di.pos_off);
 			if (di.pos_float3)
 			{
-				float f[3]; memcpy(f, p + di.pos_off, sizeof(f));
+				float f[3]; memcpy(f, pp, sizeof(f));
 				o.x = f[0]; o.y = f[1]; o.z = f[2];
 			}
 			else
 			{
-				std::int16_t ps[4]; memcpy(ps, p + di.pos_off, sizeof(ps));
+				std::int16_t ps[4]; memcpy(ps, pp, sizeof(ps));
 				o.x = static_cast<float>(ps[0]);
 				o.y = static_cast<float>(ps[1]);
 				o.z = static_cast<float>(ps[2]);
@@ -825,12 +1087,12 @@ namespace comp::ac2_ff
 
 			if (di.has_nrm && di.nrm_float3)
 			{
-				float f[3]; memcpy(f, p + di.nrm_off, sizeof(f));
+				float f[3]; memcpy(f, at(di.nrm_stream, di.nrm_off), sizeof(f));
 				o.nx = f[0]; o.ny = f[1]; o.nz = f[2];
 			}
 			else if (di.has_nrm)
 			{
-				const std::uint8_t* nb = p + di.nrm_off;
+				const std::uint8_t* nb = at(di.nrm_stream, di.nrm_off);
 				o.nx = (nb[0] - 127.0f) * (1.0f / 127.0f);
 				o.ny = (nb[1] - 127.0f) * (1.0f / 127.0f);
 				o.nz = (nb[2] - 127.0f) * (1.0f / 127.0f);
@@ -839,28 +1101,82 @@ namespace comp::ac2_ff
 
 			if (di.has_uv && di.uv_float2)
 			{
-				float f[2]; memcpy(f, p + di.uv_off, sizeof(f));
+				float f[2]; memcpy(f, at(di.uv_stream, di.uv_off), sizeof(f));
 				o.u = f[0]; o.v = f[1];
 			}
 			else if (di.has_uv)
 			{
-				std::int16_t t[2]; memcpy(t, p + di.uv_off, sizeof(t));
-				o.u = t[0] * (1.0f / 32767.0f);
-				o.v = t[1] * (1.0f / 32767.0f);
+				std::int16_t t[2]; memcpy(t, at(di.uv_stream, di.uv_off), sizeof(t));
+				o.u = t[0] * UV_SHORT2N_SCALE;
+				o.v = t[1] * UV_SHORT2N_SCALE;
 			}
 			else { o.u = 0.0f; o.v = 0.0f; }
 		}
 
-		UINT convert_range(IDirect3DVertexBuffer9* src, UINT stride, const decl_info& di,
+		UINT convert_range(const vtx_streams& s, const decl_info& di,
 			UINT first, UINT count, ff_vertex* out)
 		{
-			void* data = nullptr;
-			if (FAILED(src->Lock(0, 0, &data, D3DLOCK_READONLY)) || !data) return 0;
-			const auto* base = static_cast<const std::uint8_t*>(data);
 			for (UINT v = 0; v < count; ++v)
-				decode_vertex(base + static_cast<std::size_t>(stride) * (first + v), di, out[v]);
-			src->Unlock();
+				decode_vertex(s, first + v, di, out[v]);
 			return count;
+		}
+
+		// Lock every stream a declaration uses, run `body`, then unlock exactly what
+		// was locked. Streams are gathered by index, so two attributes sharing one
+		// stream lock that buffer once - double-locking the same VB is legal but
+		// double-unlocking is not.
+		//
+		// Returns false if any needed stream is missing or unlockable, in which case
+		// nothing stays locked.
+		// Lock exactly the streams in `need`, gather them, run `body`, unlock.
+		// Takes the stream set rather than a decl_info because the vegetation path
+		// reads FOUR attributes (TEXCOORD1/2/4/5) and decl_info only describes
+		// three. Locking a stream twice (e.g. by calling this once per descriptor)
+		// would be both redundant and fragile - the set has to be unioned first.
+		template <typename F>
+		bool with_stream_mask(IDirect3DDevice9* dev, const bool (&need)[MAX_STREAMS], F&& body)
+		{
+			IDirect3DVertexBuffer9* vb[MAX_STREAMS]{};
+			bool locked[MAX_STREAMS]{};
+			vtx_streams s{};
+			bool ok = true;
+
+			for (UINT i = 0; i < MAX_STREAMS && ok; ++i)
+			{
+				if (!need[i]) continue;
+				UINT soff = 0, stride = 0;
+				if (FAILED(dev->GetStreamSource(i, &vb[i], &soff, &stride)) || !vb[i] || !stride)
+				{
+					ok = false; break;
+				}
+				void* data = nullptr;
+				if (FAILED(vb[i]->Lock(0, 0, &data, D3DLOCK_READONLY)) || !data)
+				{
+					ok = false; break;
+				}
+				locked[i] = true;
+				s.base[i] = static_cast<const std::uint8_t*>(data) + soff;
+				s.stride[i] = stride;
+			}
+
+			if (ok) ok = body(s);
+
+			for (UINT i = 0; i < MAX_STREAMS; ++i)
+			{
+				if (locked[i]) vb[i]->Unlock();
+				if (vb[i]) vb[i]->Release();
+			}
+			return ok;
+		}
+
+		template <typename F>
+		bool with_streams(IDirect3DDevice9* dev, const decl_info& di, F&& body)
+		{
+			bool need[MAX_STREAMS]{};
+			need[di.pos_stream] = true;
+			if (di.has_nrm) need[di.nrm_stream] = true;
+			if (di.has_uv)  need[di.uv_stream] = true;
+			return with_stream_mask(dev, need, std::forward<F>(body));
 		}
 
 		// |w| is constant per draw; read one vertex and cache it.
@@ -1003,8 +1319,8 @@ namespace comp::ac2_ff
 			{
 				std::int16_t t[2];
 				memcpy(t, p + si.uv_off, sizeof(t));
-				o.u = t[0] * (1.0f / 32767.0f);
-				o.v = t[1] * (1.0f / 32767.0f);
+				o.u = t[0] * UV_SHORT2N_SCALE;
+				o.v = t[1] * UV_SHORT2N_SCALE;
 			}
 			else { o.u = 0.0f; o.v = 0.0f; }
 		}
@@ -1012,6 +1328,30 @@ namespace comp::ac2_ff
 		s_skin_diag_capturing = false;   // this draw is done
 		src->Unlock();
 		return count;
+	}
+
+	// Defined here rather than beside the other dumps: it reads globals that live
+	// in the anonymous namespace further down this file.
+	void dump_cache_diag(std::ostream& os)
+	{
+		os << "\n---- shadow-VB cache integrity (disappearing geometry) ----\n";
+		os << "  The cache is keyed ONLY on the source VB pointer, but the conversion\n";
+		os << "  also depends on stride+declaration and on the source CONTENTS.\n";
+		os << "    decl_mismatch > 0 => one VB is drawn with >1 layout; the key is wrong\n";
+		os << "    STALE > 0         => the game re-fills a MANAGED VB (streaming) and our\n";
+		os << "                         copy is frozen at the old contents\n";
+		os << "    both 0            => the cache is sound; look elsewhere\n";
+		os << "  cache hits         : " << g_cache_diag.hits << "\n";
+		os << "  decl_mismatch      : " << g_cache_diag.decl_mismatch << "\n";
+		os << "  staleness checked  : " << g_cache_diag.stale_checked << "  (sampled 1-in-512)\n";
+		os << "  STALE (src changed): " << g_cache_diag.stale_found << "\n";
+
+		os << "\n  dynamic-VB pool threads : " << g_dyn_thread_count;
+		for (std::uint32_t i = 0; i < g_dyn_thread_count; ++i) os << "  " << g_dyn_threads[i];
+		if (g_dyn_thread_overflow) os << "  (+" << g_dyn_thread_overflow << " more)";
+		os << "\n";
+		os << "    1 thread  => the unlocked pool CANNOT race; a lock would be pure cost\n";
+		os << "    >1 thread => the pool race is real; lock it\n";
 	}
 
 	void dump_rejected_formats(std::ostream& os)
@@ -1041,7 +1381,8 @@ namespace comp::ac2_ff
 		return s_have_matrices;
 	}
 
-	void register_ps_diffuse_stage(IDirect3DPixelShader9* ps, int stage)
+	void register_ps_diffuse_stage(IDirect3DPixelShader9* ps, int stage, int rank,
+		const char* name, bool normal_only)
 	{
 		if (!ps) return;
 		std::lock_guard<std::mutex> lk(s_mutex);
@@ -1053,7 +1394,17 @@ namespace comp::ac2_ff
 		// Holding a ref keeps the address uniquely ours.
 		auto it = s_ps_diffuse.find(ps);
 		if (it == s_ps_diffuse.end()) ps->AddRef();
-		s_ps_diffuse[ps] = stage;
+
+		ps_diffuse_info info{};
+		info.stage = stage;
+		info.rank = rank;
+		info.normal_only = normal_only;
+		if (name)
+		{
+			std::strncpy(info.name, name, sizeof(info.name) - 1);
+			info.name[sizeof(info.name) - 1] = '\0';
+		}
+		s_ps_diffuse[ps] = info;
 	}
 
 	int get_ps_diffuse_stage(IDirect3DPixelShader9* ps)
@@ -1061,7 +1412,156 @@ namespace comp::ac2_ff
 		if (!ps) return -1;
 		std::lock_guard<std::mutex> lk(s_mutex);
 		auto it = s_ps_diffuse.find(ps);
-		return (it == s_ps_diffuse.end()) ? -1 : it->second;
+		return (it == s_ps_diffuse.end()) ? -1 : it->second.stage;
+	}
+
+	ps_diffuse_info get_ps_diffuse_info(IDirect3DPixelShader9* ps)
+	{
+		ps_diffuse_info miss{};
+		if (!ps) return miss;
+		std::lock_guard<std::mutex> lk(s_mutex);
+		auto it = s_ps_diffuse.find(ps);
+		return (it == s_ps_diffuse.end()) ? miss : it->second;
+	}
+
+	void dump_normal_only(std::ostream& os)
+	{
+		os << "\n---- NORMAL-ONLY materials (water / volume fog) ----\n";
+		os << "  conversion         : " << (g_normal_only_materials ? "ON" : "off") << "   (F2)\n";
+		os << "  draws converted    : " << g_normal_only_draws << "\n";
+		os << "  These have NO diffuse sampler at any stage - only a normal map (+depth,\n";
+		os << "  reflection). They were previously refused as `no_diffuse`, so FF-ONLY mode\n";
+		os << "  deleted the water from the scene. The texture we bind is the NORMAL MAP,\n";
+		os << "  purely as an identity for Remix to hash: tag that hash in rtx.conf\n";
+		os << "  (rtx.animatedWaterTextures + rtx.opaqueMaterial.layeredWaterNormalEnable\n";
+		os << "  for water). Volume fog shares the identical sampler signature and is NOT\n";
+		os << "  separated here on purpose - its normal map is a different texture, so it\n";
+		os << "  gets a different hash and can be tagged independently.\n";
+	}
+
+	void dump_veg(std::ostream& os)
+	{
+		os << "\n---- VEGETATION (RealTree: no dcl_position, VS-generated) ----\n";
+		os << "  trunk conversion   : " << (g_veg_trunks ? "ON" : "off")
+			<< "    leaf conversion: " << (g_veg_leaves ? "ON" : "off") << "\n";
+		os << "  draws seen by family:\n";
+		os << "    trunk   : " << g_veg.seen[static_cast<int>(veg_kind::trunk)] << "\n";
+		os << "    leaves  : " << g_veg.seen[static_cast<int>(veg_kind::leaves)] << "\n";
+		os << "    clutter : " << g_veg.seen[static_cast<int>(veg_kind::clutter)]
+			<< "   (grass; expected 0 - no runtime decl carries TEXCOORD9)\n";
+		os << "  trunk CONVERTED    : " << g_veg.trunk_converted << "\n";
+		os << "  trunk rejects:\n";
+		os << "    no_decl    : " << g_veg.trunk_no_decl
+			<< "   (missing TEXCOORD4/5/2/1 of the expected type)\n";
+		os << "    no_const   : " << g_veg.trunk_no_const
+			<< "   (TrunkStencil/CompressionParams never uploaded)\n";
+		os << "    no_diffuse : " << g_veg.trunk_no_diffuse << "   (depth/shadow pass - correct)\n";
+		os << "    no_vb      : " << g_veg.trunk_no_vb << "\n";
+		os << "    no_camera  : " << g_veg.trunk_no_camera << "   (ortho / decompose failed)\n";
+		os << "  stencil ring clamped: " << g_veg.stencil_clamped
+			<< "   (>0 means the ring index left [0,56) - trunk shape is deformed)\n";
+		os << "  leaf CONVERTED     : " << g_veg.leaf_converted << "\n";
+		os << "  leaf rejects:\n";
+		os << "    no_decl    : " << g_veg.leaf_no_decl
+			<< "   (missing TEXCOORD0/1/2/4 of the expected type)\n";
+		os << "    no_const   : " << g_veg.leaf_no_const
+			<< "   (LeavesEquations/oscillators never uploaded)\n";
+		os << "    no_diffuse : " << g_veg.leaf_no_diffuse << "   (depth/shadow pass - correct)\n";
+		os << "    no_vb      : " << g_veg.leaf_no_vb << "\n";
+		os << "    no_camera  : " << g_veg.leaf_no_camera << "   (ortho / decompose failed)\n";
+		os << "  leaf eq clamped    : " << g_veg.leaf_eq_clamped
+			<< "   (>0 means the equation index left [0,6) - leaf size is wrong)\n";
+	}
+
+	void register_vs_info(IDirect3DVertexShader9* vs, veg_kind kind, std::uint32_t hash)
+	{
+		if (!vs) return;
+		std::lock_guard<std::mutex> lk(s_mutex);
+		// AddRef for the same reason s_ps_diffuse does: a released shader's address
+		// gets handed back to a later CreateVertexShader, and we would then answer
+		// for the wrong shader. Holding a ref keeps the address uniquely ours.
+		auto it = s_vs_veg.find(vs);
+		if (it == s_vs_veg.end()) vs->AddRef();
+		// Keep any counts already accumulated against this object: the game can
+		// re-create from identical bytecode, and zeroing here would quietly reset
+		// the very coverage we are trying to measure.
+		vs_info& info = s_vs_veg[vs];
+		info.kind = kind;
+		info.hash = hash;
+	}
+
+	// Every draw's outcome, attributed to the shader that issued it.
+	static void note_vs_draw(IDirect3DVertexShader9* vs, bool converted)
+	{
+		if (!vs) return;
+		std::lock_guard<std::mutex> lk(s_mutex);
+		auto it = s_vs_veg.find(vs);
+		if (it == s_vs_veg.end()) return;   // created before our hook: nothing to name it
+		it->second.seen++;
+		if (converted) it->second.converted++;
+	}
+
+	void dump_vs_coverage(std::ostream& os)
+	{
+		struct row { std::uint32_t hash = 0, seen = 0, conv = 0; veg_kind kind = veg_kind::none; };
+		std::vector<row> rows;
+		{
+			std::lock_guard<std::mutex> lk(s_mutex);
+			for (const auto& kv : s_vs_veg)
+			{
+				if (!kv.second.seen) continue;
+				rows.push_back({ kv.second.hash, kv.second.seen, kv.second.converted, kv.second.kind });
+			}
+		}
+		// Merge by BYTECODE hash: many shader objects share one bytecode, and the
+		// template is a property of the bytecode, not of the object.
+		std::map<std::uint32_t, row> byhash;
+		for (const auto& r : rows)
+		{
+			auto& d = byhash[r.hash];
+			d.hash = r.hash;
+			if (r.kind != veg_kind::none) d.kind = r.kind;
+			d.seen += r.seen; d.conv += r.conv;
+		}
+		std::vector<row> out;
+		out.reserve(byhash.size());
+		for (const auto& kv : byhash) out.push_back(kv.second);
+		// Most-dropped first: that IS the ranked list of what is still missing.
+		std::sort(out.begin(), out.end(), [](const row& a, const row& b)
+		{
+			return (a.seen - a.conv) > (b.seen - b.conv);
+		});
+
+		os << "\n---- PER-SHADER COVERAGE (what is still missing?) ----\n";
+		os << "  The totals cannot answer this: no_diffuse is ~45% of draws and is MOSTLY\n";
+		os << "  CORRECT (depth/shadow/AO). Water hid in that counter for the whole project.\n";
+		os << "  A shader with many draws and 0% converted is the signature of a gap.\n";
+		os << "  Name these offline:  python tools/name_live_shaders.py <game-dir> <assets-dir>\n";
+		os << "  hash        seen        converted   pct   dropped     family\n";
+		int n = 0;
+		for (const auto& r : out)
+		{
+			if (++n > 40) break;
+			const int pct = r.seen ? static_cast<int>(100.0 * r.conv / r.seen + 0.5) : 0;
+			const char* fam = (r.kind == veg_kind::trunk) ? "trunk"
+				: (r.kind == veg_kind::leaves) ? "leaves"
+				: (r.kind == veg_kind::clutter) ? "clutter" : "-";
+			os << "  0x" << std::hex << std::setw(8) << std::setfill('0') << r.hash
+				<< std::dec << std::setfill(' ')
+				<< "  " << std::setw(10) << r.seen
+				<< "  " << std::setw(10) << r.conv
+				<< "  " << std::setw(3) << pct << "%"
+				<< "  " << std::setw(10) << (r.seen - r.conv)
+				<< "  " << fam << "\n";
+		}
+	}
+
+	veg_kind get_vs_veg(IDirect3DVertexShader9* vs)
+	{
+		if (!vs) return veg_kind::none;
+		std::lock_guard<std::mutex> lk(s_mutex);
+		auto it = s_vs_veg.find(vs);
+		return (it == s_vs_veg.end()) ? veg_kind::none : it->second.kind;
 	}
 
 	void shutdown()
@@ -1074,6 +1574,712 @@ namespace comp::ac2_ff
 		}
 		s_shadow.clear();
 		s_scale.clear();
+	}
+
+	// =========================================================================
+	// Vegetation: the trunk family (TrunkStencil)
+	// =========================================================================
+	// A CPU port of the RealTree trunk vertex path. The mesh in the VB is not
+	// geometry at all - it is a SKELETON: TEXCOORD4 gives a compressed spine
+	// point plus a radius in .w, and the shader sweeps a ring around it using a
+	// per-ring cross-section from TrunkStencil[] (c150, 56 regs):
+	//
+	//   base   = TC4.xyz * CompressionParams.y + CompressionParams.x
+	//   radius = TC4.w   * CompressionParams.z + 1e-6
+	//   ring   = trunc(dot(TC1.xyz, OffsetInStencil.xyz))
+	//   t1     = cross(TC5, TC2)      ; TC5 = spine axis
+	//   t2     = cross(TC5, t1)
+	//   dir    = TrunkStencil[ring].x * t1 + TrunkStencil[ring].y * t2
+	//   pos    = base + radius * dir
+	//   normal = normalize(radius * dir)
+	//
+	// Output is MODEL space (the shader does `dp4 o0, r0, c0` = WVP * pos), so
+	// the existing World/View/Proj derivation applies unchanged and there is no
+	// |w| scale to recover - CompressionParams does that job here.
+	//
+	//   uv     = TEXCOORD0.xy * TrunkUVDecompression.y + TrunkUVDecompression.x
+	//
+	// > The live shader is the authority, NOT the asset corpus. An earlier version
+	// > of this port read ONE trunk shader out of the 47 in the assets (picked by
+	// > `grep -l TrunkStencil | head -1`) and generalised it. That variant is one of
+	// > only 6 that build a PROCEDURAL world-space UV and one of the few that apply
+	// > a VFalloff/VDistScale distance fade. All FOUR trunk shaders the game
+	// > actually creates do neither: they decompress a real TEXCOORD0 through
+	// > TrunkUVDecompression (c211) and have no fade at all. The result was broken
+	// > UVs plus a jitter - the fade read c100/c101, which no live trunk shader
+	// > declares, so it was differencing ALIASED leftovers from other shaders
+	// > against the eye position and moving every vertex a little each frame.
+	// > Cross-check a runtime dump (`<game>\ac2_rtx_dump\shaders`) before believing
+	// > any variant-specific detail; 47 assets can outvote the 4 that run.
+	veg_stats g_veg{};
+
+	namespace
+	{
+		constexpr int TRUNK_STENCIL_REG = 150;
+		constexpr int TRUNK_STENCIL_COUNT = 56;
+
+		struct veg_decl
+		{
+			bool ok = false;
+			UINT base_stream = 0, base_off = 0;   // TEXCOORD4 SHORT4N: spine + radius
+			UINT axis_stream = 0, axis_off = 0;   // TEXCOORD5 SHORT4N: spine axis
+			UINT ref_stream = 0, ref_off = 0;     // TEXCOORD2 D3DCOLOR: frame reference
+			UINT sten_stream = 0, sten_off = 0;   // TEXCOORD1 FLOAT4: ring index + LOD
+			UINT uv_stream = 0, uv_off = 0;       // TEXCOORD0 SHORT4: compressed UV
+			bool have_axis = false, have_ref = false, have_sten = false, have_uv = false;
+		};
+
+		// Select by SEMANTIC, never by register: the base position is TEXCOORD4 on
+		// trunk/leaves but TEXCOORD9 on clutter, and the register carrying it moves
+		// (v3/v4/v6/v8) between variants of the same family.
+		veg_decl classify_veg(const D3DVERTEXELEMENT9* e, UINT n)
+		{
+			veg_decl d;
+			for (UINT i = 0; i < n && e[i].Stream != 0xFF; ++i)
+			{
+				if (e[i].Usage != D3DDECLUSAGE_TEXCOORD) continue;
+				if (e[i].Stream >= MAX_STREAMS) continue;
+				switch (e[i].UsageIndex)
+				{
+				case 4:
+					if (e[i].Type == D3DDECLTYPE_SHORT4N)
+					{
+						d.base_stream = e[i].Stream; d.base_off = e[i].Offset; d.ok = true;
+					}
+					break;
+				case 5:
+					if (e[i].Type == D3DDECLTYPE_SHORT4N)
+					{
+						d.axis_stream = e[i].Stream; d.axis_off = e[i].Offset; d.have_axis = true;
+					}
+					break;
+				case 2:
+					if (e[i].Type == D3DDECLTYPE_D3DCOLOR)
+					{
+						d.ref_stream = e[i].Stream; d.ref_off = e[i].Offset; d.have_ref = true;
+					}
+					break;
+				case 1:
+					if (e[i].Type == D3DDECLTYPE_FLOAT4)
+					{
+						d.sten_stream = e[i].Stream; d.sten_off = e[i].Offset; d.have_sten = true;
+					}
+					break;
+				case 0:
+					// SHORT4, NOT SHORT4N: the VS reads v0 as raw integers and
+					// TrunkUVDecompression supplies the scale, so D3D must not be
+					// normalising here and neither must we.
+					if (e[i].Type == D3DDECLTYPE_SHORT4)
+					{
+						d.uv_stream = e[i].Stream; d.uv_off = e[i].Offset; d.have_uv = true;
+					}
+					break;
+				default: break;
+				}
+			}
+			// Every one of these is load-bearing for the sweep; without the axis or
+			// the reference there is no frame, without TC1 there is no ring, and
+			// without TC0 there is no UV.
+			if (!d.have_axis || !d.have_ref || !d.have_sten || !d.have_uv) d.ok = false;
+			return d;
+		}
+
+		// Everything the sweep needs that is constant across the draw.
+		struct trunk_consts
+		{
+			D3DXVECTOR4 cp{};        // c120 CompressionParams
+			D3DXVECTOR4 offset{};    // c208 OffsetInStencil
+			D3DXVECTOR4 morph{};     // c207 MorphEnabled
+			D3DXVECTOR4 lod{};       // c210 LevelLOD
+			D3DXVECTOR4 uvdec{};     // c211 TrunkUVDecompression
+			D3DXVECTOR4 stencil[TRUNK_STENCIL_COUNT]{};
+			float t = 0.0f;          // saturate(DistanceFactors.x*d + DistanceFactors.y)
+		};
+
+		inline float sat(float v) { return (v < 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+		inline D3DXVECTOR3 read_short4n_xyz(const std::uint8_t* p, float& w)
+		{
+			const std::int16_t* s = reinterpret_cast<const std::int16_t*>(p);
+			w = static_cast<float>(s[3]) / 32767.0f;
+			return D3DXVECTOR3(static_cast<float>(s[0]) / 32767.0f,
+				static_cast<float>(s[1]) / 32767.0f,
+				static_cast<float>(s[2]) / 32767.0f);
+		}
+
+		// D3DCOLOR expands to (R,G,B,A)/255 in the VS - memory order is B,G,R,A.
+		inline D3DXVECTOR3 read_d3dcolor_rgb(const std::uint8_t* p)
+		{
+			return D3DXVECTOR3(p[2] / 255.0f, p[1] / 255.0f, p[0] / 255.0f);
+		}
+
+		bool read_trunk_consts(IDirect3DDevice9* dev, const D3DXMATRIX& world_c8,
+			trunk_consts& c)
+		{
+			D3DXVECTOR4 eye{}, fov{}, dfac{};
+			// Every one of these is declared by all four live trunk shaders, so a
+			// failed read means the constant genuinely never arrived - refuse the
+			// draw rather than substitute a default.
+			//
+			// Do NOT add reads for constants the live shaders don't declare. Registers
+			// ALIAS across shader variants: c100/c101 (VFalloff/VDistScale) are not
+			// declared by any live trunk shader, so reading them returns whatever the
+			// last unrelated shader left there. An earlier version did exactly that
+			// and used the result to displace vertices - producing a camera-dependent
+			// jitter that came and went with whatever ran before.
+			if (!read_vs_const(dev, TRUNK_STENCIL_REG,
+				reinterpret_cast<float*>(c.stencil), TRUNK_STENCIL_COUNT)) return false;
+			if (!read_vs_const(dev, 120, reinterpret_cast<float*>(&c.cp), 1)) return false;
+			if (!read_vs_const(dev, 208, reinterpret_cast<float*>(&c.offset), 1)) return false;
+			if (!read_vs_const(dev, 211, reinterpret_cast<float*>(&c.uvdec), 1)) return false;
+			if (!read_vs_const(dev, 207, reinterpret_cast<float*>(&c.morph), 1)) return false;
+			if (!read_vs_const(dev, 210, reinterpret_cast<float*>(&c.lod), 1)) return false;
+			if (!read_vs_const(dev, 209, reinterpret_cast<float*>(&dfac), 1)) return false;
+			if (!read_vs_const(dev, 12, reinterpret_cast<float*>(&eye), 1)) return false;
+			if (!read_vs_const(dev, 96, reinterpret_cast<float*>(&fov), 1)) return false;
+
+			// The shader measures distance from the eye to the object's ORIGIN -
+			// the World translation, read out of the transposed c8..c11 as
+			// (c8.w, c9.w, c10.w). world_c8 here is already un-transposed, so the
+			// translation is its row 3.
+			const D3DXVECTOR3 origin(world_c8.m[3][0], world_c8.m[3][1], world_c8.m[3][2]);
+			const D3DXVECTOR3 d(origin.x - eye.x, origin.y - eye.y, origin.z - eye.z);
+			c.t = sat(dfac.x * (D3DXVec3Length(&d) * fov.x) + dfac.y);
+			return true;
+		}
+
+		// One skeleton vertex -> one swept ring vertex.
+		void decode_trunk_vertex(const vtx_streams& s, UINT v, const veg_decl& d,
+			const trunk_consts& c, ff_vertex& o)
+		{
+			const std::uint8_t* pb = s.base[d.base_stream] + v * s.stride[d.base_stream] + d.base_off;
+			const std::uint8_t* pa = s.base[d.axis_stream] + v * s.stride[d.axis_stream] + d.axis_off;
+			const std::uint8_t* pr = s.base[d.ref_stream] + v * s.stride[d.ref_stream] + d.ref_off;
+			const std::uint8_t* ps = s.base[d.sten_stream] + v * s.stride[d.sten_stream] + d.sten_off;
+			const std::uint8_t* pu = s.base[d.uv_stream] + v * s.stride[d.uv_stream] + d.uv_off;
+
+			float bw = 0.0f;
+			const D3DXVECTOR3 raw = read_short4n_xyz(pb, bw);
+			D3DXVECTOR3 base(raw.x * c.cp.y + c.cp.x,
+				raw.y * c.cp.y + c.cp.x,
+				raw.z * c.cp.y + c.cp.x);
+
+			float aw = 0.0f;
+			const D3DXVECTOR3 axis = read_short4n_xyz(pa, aw);
+			const D3DXVECTOR3 ref = read_d3dcolor_rgb(pr);
+			const float* tc1 = reinterpret_cast<const float*>(ps);
+
+			// ring = trunc-toward-zero(dot(TC1.xyz, OffsetInStencil.xyz)). The shader
+			// spells that out with frc/slt rather than using a round instruction.
+			const float f = tc1[0] * c.offset.x + tc1[1] * c.offset.y + tc1[2] * c.offset.z;
+			int ring = static_cast<int>(f);
+			if (ring < 0 || ring >= TRUNK_STENCIL_COUNT)
+			{
+				// mova would wrap into unrelated constants; refuse instead. Counted,
+				// because a clamped ring silently deforms the trunk.
+				g_veg.stencil_clamped++;
+				ring = (ring < 0) ? 0 : (TRUNK_STENCIL_COUNT - 1);
+			}
+			const D3DXVECTOR4& st = c.stencil[ring];
+
+			// radius, with the distance morph folded in
+			const float radius0 = bw * c.cp.z + 1e-6f;
+			const float m = c.t * c.morph.x * st.z + 1.0f;
+			// LOD gate: `sge (LevelLOD.x / TC1.w), 1` -> shrink this ring away with
+			// distance. A zero TC1.w would divide by zero in the shader too; guard.
+			const float inv_w = (fabsf(tc1[3]) > 1e-20f) ? (c.lod.x / tc1[3]) : 0.0f;
+			const float k = 1.0f - ((inv_w >= 1.0f) ? 1.0f : 0.0f) * c.t;
+			const float R = radius0 * m * k;
+
+			D3DXVECTOR3 t1, t2;
+			D3DXVec3Cross(&t1, &axis, &ref);
+			D3DXVec3Cross(&t2, &axis, &t1);
+
+			const D3DXVECTOR3 dir(st.x * t1.x + st.y * t2.x,
+				st.x * t1.y + st.y * t2.y,
+				st.x * t1.z + st.y * t2.z);
+
+			const D3DXVECTOR3 pos(base.x + R * dir.x, base.y + R * dir.y, base.z + R * dir.z);
+
+			// The sweep direction IS the outward radial normal of the cylinder.
+			// Two of the four live shaders emit no normal at all (they are unlit
+			// passes) - but FF_FVF has one and Remix shades with it, so it is
+			// generated here regardless. R only scales it; normalising removes R.
+			D3DXVECTOR3 nrm(R * dir.x, R * dir.y, R * dir.z);
+			if (D3DXVec3LengthSq(&nrm) > 1e-20f) D3DXVec3Normalize(&nrm, &nrm);
+			else nrm = D3DXVECTOR3(0.0f, 0.0f, 1.0f);
+
+			o.x = pos.x; o.y = pos.y; o.z = pos.z;
+			o.nx = nrm.x; o.ny = nrm.y; o.nz = nrm.z;
+
+			// uv = TEXCOORD0.xy * TrunkUVDecompression.y + TrunkUVDecompression.x.
+			// SHORT4 (not SHORT4N): the VS sees raw integers, so no /32767 here -
+			// c211.y carries the whole scale.
+			const std::int16_t* uraw = reinterpret_cast<const std::int16_t*>(pu);
+			o.u = static_cast<float>(uraw[0]) * c.uvdec.y + c.uvdec.x;
+			o.v = static_cast<float>(uraw[1]) * c.uvdec.y + c.uvdec.x;
+		}
+
+		// ---- leaves (LeavesEquations) ------------------------------------
+		// A leaf is a card that MORPHS with distance between an object-space
+		// offset and a camera-facing billboard, then gets wind added:
+		//
+		//   base   = TEXCOORD4.xyz * CompressionParams.y + CompressionParams.x
+		//   eye_l  = the eye in tree-local space (yaw-only; see below)
+		//   size   = clamp(dist, eq.x, eq.y) * eq.z + eq.w      ; eq = LeavesEquations[i]
+		//   fixed  = (TEXCOORD1.xyz*2-1) * (TEXCOORD4.w * TEXCOORD2.x) * size*TEXCOORD4.w
+		//   card   = (TEXCOORD0.x*2-1) * normalize(-eye_l.y, eye_l.x, TEXCOORD0.y*2-1) * ...
+		//   pos    = base + lerp(fixed, card, morph) + wind
+		//   uv     = TEXCOORD0.zw          ; raw D3DCOLOR components, no decompression
+		//
+		// The wind is genuine per-frame animation (two oscillators with a time
+		// seed), so leaf geometry is EXPECTED to change every frame - unlike the
+		// trunk, where any per-frame change was a bug.
+		struct leaf_decl
+		{
+			bool ok = false;
+			UINT base_stream = 0, base_off = 0;     // TEXCOORD4 SHORT4N: centre + size
+			UINT corner_stream = 0, corner_off = 0; // TEXCOORD0 D3DCOLOR: .xy corner, .zw uv
+			UINT dir_stream = 0, dir_off = 0;       // TEXCOORD1 D3DCOLOR: .xyz offset, .w index
+			UINT scale_stream = 0, scale_off = 0;   // TEXCOORD2 FLOAT1: per-leaf scale
+			bool have_corner = false, have_dir = false, have_scale = false;
+		};
+
+		leaf_decl classify_leaves(const D3DVERTEXELEMENT9* e, UINT n)
+		{
+			leaf_decl d;
+			for (UINT i = 0; i < n && e[i].Stream != 0xFF; ++i)
+			{
+				if (e[i].Usage != D3DDECLUSAGE_TEXCOORD) continue;
+				if (e[i].Stream >= MAX_STREAMS) continue;
+				switch (e[i].UsageIndex)
+				{
+				case 4:
+					if (e[i].Type == D3DDECLTYPE_SHORT4N)
+					{
+						d.base_stream = e[i].Stream; d.base_off = e[i].Offset; d.ok = true;
+					}
+					break;
+				case 0:
+					if (e[i].Type == D3DDECLTYPE_D3DCOLOR)
+					{
+						d.corner_stream = e[i].Stream; d.corner_off = e[i].Offset; d.have_corner = true;
+					}
+					break;
+				case 1:
+					if (e[i].Type == D3DDECLTYPE_D3DCOLOR)
+					{
+						d.dir_stream = e[i].Stream; d.dir_off = e[i].Offset; d.have_dir = true;
+					}
+					break;
+				case 2:
+					if (e[i].Type == D3DDECLTYPE_FLOAT1)
+					{
+						d.scale_stream = e[i].Stream; d.scale_off = e[i].Offset; d.have_scale = true;
+					}
+					break;
+				default: break;
+				}
+			}
+			if (!d.have_corner || !d.have_dir || !d.have_scale) d.ok = false;
+			return d;
+		}
+
+		constexpr int LEAF_EQ_REG = 214;
+		constexpr int LEAF_EQ_COUNT = 6;
+
+		struct leaf_consts
+		{
+			D3DXVECTOR4 cp{};                  // c120 CompressionParams
+			D3DXVECTOR4 morphfact{};           // c213 LeavesMorphFact
+			D3DXVECTOR4 eq[LEAF_EQ_COUNT]{};   // c214..c219 LeavesEquations
+			D3DXVECTOR4 osc0_scale{};          // c100 Oscil0AnimScale
+			D3DXVECTOR4 osc0_phase{};          // c101 Oscil0        (time seed)
+			D3DXVECTOR4 osc0_seed{};           // c102 Oscil0PosSeedCoefficient
+			D3DXVECTOR4 osc1_seed{};           // c103 Oscil1PosSeedCoefficient
+			D3DXVECTOR4 osc1_phase{};          // c104 Oscil1        (time seed)
+			D3DXVECTOR4 osc1_scale{};          // c105 Oscil1AnimScale
+			D3DXVECTOR4 entity{};              // c13  g_WorldEntityPosition
+			float dist = 0.0f;                 // |eye_local| * g_FovDistanceScale
+			D3DXVECTOR3 eye_dir{};             // normalize(eye_local)
+		};
+
+		bool read_leaf_consts(IDirect3DDevice9* dev, const D3DXMATRIX& w, leaf_consts& c)
+		{
+			D3DXVECTOR4 eye{}, fov{};
+			if (!read_vs_const(dev, LEAF_EQ_REG, reinterpret_cast<float*>(c.eq), LEAF_EQ_COUNT)) return false;
+			if (!read_vs_const(dev, 120, reinterpret_cast<float*>(&c.cp), 1)) return false;
+			if (!read_vs_const(dev, 213, reinterpret_cast<float*>(&c.morphfact), 1)) return false;
+			if (!read_vs_const(dev, 100, reinterpret_cast<float*>(&c.osc0_scale), 1)) return false;
+			if (!read_vs_const(dev, 101, reinterpret_cast<float*>(&c.osc0_phase), 1)) return false;
+			if (!read_vs_const(dev, 102, reinterpret_cast<float*>(&c.osc0_seed), 1)) return false;
+			if (!read_vs_const(dev, 103, reinterpret_cast<float*>(&c.osc1_seed), 1)) return false;
+			if (!read_vs_const(dev, 104, reinterpret_cast<float*>(&c.osc1_phase), 1)) return false;
+			if (!read_vs_const(dev, 105, reinterpret_cast<float*>(&c.osc1_scale), 1)) return false;
+			if (!read_vs_const(dev, 13, reinterpret_cast<float*>(&c.entity), 1)) return false;
+			if (!read_vs_const(dev, 12, reinterpret_cast<float*>(&eye), 1)) return false;
+			if (!read_vs_const(dev, 96, reinterpret_cast<float*>(&fov), 1)) return false;
+
+			// The eye, in the tree's local space. The shader builds this by hand and
+			// assumes the tree's World is a YAW-ONLY rotation: it uses (m00, m01) for
+			// local X and the perpendicular (-m01, m00) for local Y rather than the
+			// matrix's real second row, and takes Z as a plain difference. Replicated
+			// exactly - a "more correct" full inverse would not match the game.
+			const float dx = eye.x - w.m[3][0];
+			const float dy = eye.y - w.m[3][1];
+			const D3DXVECTOR3 local(w.m[0][0] * dx + w.m[0][1] * dy,
+				-w.m[0][1] * dx + w.m[0][0] * dy,
+				eye.z - w.m[3][2]);
+
+			const float len = D3DXVec3Length(&local);
+			c.dist = len * fov.x;
+			c.eye_dir = (len > 1e-20f)
+				? D3DXVECTOR3(local.x / len, local.y / len, local.z / len)
+				: D3DXVECTOR3(0.0f, 1.0f, 0.0f);
+			return true;
+		}
+
+		void decode_leaf_vertex(const vtx_streams& s, UINT v, const leaf_decl& d,
+			const leaf_consts& c, ff_vertex& o)
+		{
+			const std::uint8_t* pb = s.base[d.base_stream] + v * s.stride[d.base_stream] + d.base_off;
+			const std::uint8_t* pc = s.base[d.corner_stream] + v * s.stride[d.corner_stream] + d.corner_off;
+			const std::uint8_t* pd = s.base[d.dir_stream] + v * s.stride[d.dir_stream] + d.dir_off;
+			const std::uint8_t* pS = s.base[d.scale_stream] + v * s.stride[d.scale_stream] + d.scale_off;
+
+			float bw = 0.0f;
+			const D3DXVECTOR3 raw = read_short4n_xyz(pb, bw);
+			const D3DXVECTOR3 base(raw.x * c.cp.y + c.cp.x,
+				raw.y * c.cp.y + c.cp.x,
+				raw.z * c.cp.y + c.cp.x);
+
+			const float scale = *reinterpret_cast<const float*>(pS);   // TEXCOORD2, FLOAT1
+
+			// TEXCOORD1: .xyz is an offset direction (D3DCOLOR, decoded *2-1),
+			// .w carries the leaf's equation index as a raw byte.
+			const D3DXVECTOR3 dir_raw = read_d3dcolor_rgb(pd);
+			const D3DXVECTOR3 n(dir_raw.x * 2.0f - 1.0f, dir_raw.y * 2.0f - 1.0f, dir_raw.z * 2.0f - 1.0f);
+			const float idx_byte = static_cast<float>(pd[3]);   // D3DCOLOR alpha, 0..255
+
+			// Leaves with a byte >= 99 skip the morph and index from 100; the shader
+			// spells this out with slt/lrp.
+			const float r3x = idx_byte + 0.5f;
+			const bool big = (99.0f < r3x);
+			const float morph = big ? 0.0f : sat(c.dist * c.morphfact.x + c.morphfact.y);
+			const float idx_sel = big ? (idx_byte - 99.5f) : (idx_byte + 0.5f);
+
+			int i = static_cast<int>(idx_sel - (r3x - floorf(r3x)));
+			if (i < 0 || i >= LEAF_EQ_COUNT)
+			{
+				// mova would index past LeavesEquations into unrelated constants.
+				g_veg.leaf_eq_clamped++;
+				i = (i < 0) ? 0 : (LEAF_EQ_COUNT - 1);
+			}
+			const D3DXVECTOR4& eq = c.eq[i];
+
+			// The camera-facing card axis: horizontal perpendicular to the eye
+			// direction, tilted by the corner's y.
+			const D3DXVECTOR3 corner = read_d3dcolor_rgb(pc);
+			const float a = corner.x * 2.0f - 1.0f;   // TEXCOORD0.x
+			const float b = corner.y * 2.0f - 1.0f;   // TEXCOORD0.y
+			D3DXVECTOR3 right(-c.eye_dir.y, c.eye_dir.x, b);
+			if (D3DXVec3LengthSq(&right) > 1e-20f) D3DXVec3Normalize(&right, &right);
+
+			float size = c.dist;
+			if (size < eq.x) size = eq.x;      // max, then min = clamp
+			if (size > eq.y) size = eq.y;
+			size = size * eq.z + eq.w;
+			const float size_w = size * bw;
+
+			// fixed = the object-space offset; card = the camera-facing one.
+			const float s_leaf = bw * scale;
+			const D3DXVECTOR3 fixed_off(n.x * s_leaf * size_w, n.y * s_leaf * size_w, n.z * s_leaf * size_w);
+			const float sw = size_w * scale;
+			const D3DXVECTOR3 card(sw * a * right.x - fixed_off.x,
+				sw * a * right.y - fixed_off.y,
+				sw * a * right.z - fixed_off.z);
+
+			D3DXVECTOR3 pos(base.x + fixed_off.x + morph * card.x,
+				base.y + fixed_off.y + morph * card.y,
+				base.z + fixed_off.z + morph * card.z);
+
+			// ---- wind ----------------------------------------------------
+			// The shader's frc/mad around each sincos is only RANGE REDUCTION for
+			// the hardware: frac(x/2pi + 0.5)*2pi - pi differs from x by a multiple
+			// of 2pi, so sin() of it IS sin(x). Nothing to reproduce on the CPU.
+			const D3DXVECTOR3 p(pos.x + c.entity.x, pos.y + c.entity.y, pos.z + c.entity.z);
+			const float ph0 = (c.osc0_seed.x * p.x + c.osc0_seed.y * p.y + c.osc0_seed.z * p.z) + c.osc0_phase.x;
+			const float ph1 = (c.osc1_seed.x * p.x + c.osc1_seed.y * p.y + c.osc1_seed.z * p.z) + c.osc1_phase.x;
+			const float w0 = sinf(ph0), w1 = sinf(ph1);
+			pos.x += c.osc0_scale.x * w0 + c.osc1_scale.x * w1;
+			pos.y += c.osc0_scale.y * w0 + c.osc1_scale.y * w1;
+			pos.z += c.osc0_scale.z * w0 + c.osc1_scale.z * w1;
+
+			o.x = pos.x; o.y = pos.y; o.z = pos.z;
+
+			// The live leaves VS emits NO normal - the game shades this foliage
+			// unlit (its outputs are uv, AO and a fade colour). Remix path-traces
+			// it, so a normal has to come from somewhere: the per-vertex offset
+			// direction is the closest thing available and gives a canopy a rounded
+			// look. This is OUR choice, not the game's - if foliage lighting looks
+			// wrong, this is the line to revisit.
+			D3DXVECTOR3 nrm = n;
+			if (D3DXVec3LengthSq(&nrm) > 1e-20f) D3DXVec3Normalize(&nrm, &nrm);
+			else nrm = D3DXVECTOR3(0.0f, 0.0f, 1.0f);
+			o.nx = nrm.x; o.ny = nrm.y; o.nz = nrm.z;
+
+			// uv = TEXCOORD0.zw, straight D3DCOLOR components (`mul o1, c4.zzww, v0.zwzz`).
+			o.u = pc[0] / 255.0f;   // .z = B
+			o.v = pc[3] / 255.0f;   // .w = A
+		}
+	}
+
+	// ---- vegetation trunks: sweep the skeleton on the CPU -> static geometry --
+	// Shape deliberately mirrors try_render_skinned(): both take a source the FF
+	// pipeline cannot describe, generate plain float vertices into the dynamic
+	// pool, and hand Remix ordinary static geometry.
+	static bool try_render_trunk(IDirect3DDevice9* dev, const veg_decl& vd,
+		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
+		UINT NumVertices, UINT startIndex, UINT primCount)
+	{
+		IDirect3DPixelShader9* cur_ps = nullptr;
+		dev->GetPixelShader(&cur_ps);
+		const int diffuse_stage = get_ps_diffuse_stage(cur_ps);
+		if (cur_ps) cur_ps->Release();
+		// A trunk draw with no diffuse sampler is a depth/shadow pass, exactly as
+		// on the static path - it must NOT be path-traced.
+		if (diffuse_stage < 0) { g_veg.trunk_no_diffuse++; return false; }
+
+		D3DXMATRIX wvp_t, wvp, world_c8, view, proj;
+		if (!read_vs_const(dev, 0, reinterpret_cast<float*>(&wvp_t), 4))
+		{
+			g_veg.trunk_no_camera++; return false;
+		}
+		D3DXMatrixTranspose(&wvp, &wvp_t);
+		if (!compute_camera(dev, wvp, world_c8, view, proj))
+		{
+			g_veg.trunk_no_camera++; return false;
+		}
+
+		trunk_consts tc;
+		if (!read_trunk_consts(dev, world_c8, tc)) { g_veg.trunk_no_const++; return false; }
+
+		const UINT first = static_cast<UINT>(BaseVertexIndex) + MinVertexIndex;
+		const UINT bytes = NumVertices * sizeof(ff_vertex);
+
+		IDirect3DVertexBuffer9* dyn = get_dynamic_vb(dev, bytes);
+		if (!dyn) { g_veg.trunk_no_vb++; return false; }
+
+		void* dst = nullptr;
+		if (FAILED(dyn->Lock(0, bytes, &dst, D3DLOCK_DISCARD)) || !dst)
+		{
+			g_veg.trunk_no_vb++; return false;
+		}
+
+		// The skeleton spans stream 0 (TEXCOORD1/2) and stream 1 (TEXCOORD4/5), so
+		// the vertex is GATHERED across streams - same as the multi-stream static
+		// path. Lock the union of the four attributes' streams in one pass.
+		bool need[MAX_STREAMS]{};
+		need[vd.base_stream] = true;
+		need[vd.axis_stream] = true;
+		need[vd.ref_stream] = true;
+		need[vd.sten_stream] = true;
+		need[vd.uv_stream] = true;
+
+		const bool converted = with_stream_mask(dev, need, [&](const vtx_streams& s)
+		{
+			ff_vertex* out = static_cast<ff_vertex*>(dst);
+			for (UINT i = 0; i < NumVertices; ++i)
+				decode_trunk_vertex(s, first + i, vd, tc, out[i]);
+			return true;
+		});
+		dyn->Unlock();
+		if (!converted) { g_veg.trunk_no_vb++; return false; }
+
+		// ---- save what we touch ------------------------------------------
+		IDirect3DVertexShader9* old_vs = nullptr; IDirect3DPixelShader9* old_ps = nullptr;
+		IDirect3DVertexDeclaration9* old_decl = nullptr;
+		dev->GetVertexShader(&old_vs); dev->GetPixelShader(&old_ps); dev->GetVertexDeclaration(&old_decl);
+		DWORD old_lighting = 0; dev->GetRenderState(D3DRS_LIGHTING, &old_lighting);
+		DWORD old_fill = 0; dev->GetRenderState(D3DRS_FILLMODE, &old_fill);
+		IDirect3DBaseTexture9* old_tex0 = nullptr; dev->GetTexture(0, &old_tex0);
+		IDirect3DBaseTexture9* diffuse = nullptr;
+		IDirect3DVertexBuffer9* old_s0 = nullptr; UINT old_s0_off = 0, old_s0_stride = 0;
+		dev->GetStreamSource(0, &old_s0, &old_s0_off, &old_s0_stride);
+
+		dev->SetVertexShader(nullptr);
+		dev->SetPixelShader(nullptr);
+		dev->SetFVF(FF_FVF);
+		dev->SetStreamSource(0, dyn, 0, sizeof(ff_vertex));
+
+		// The sweep emits MODEL-space positions (the shader applies WVP to them
+		// directly), so World is plain g_World - CompressionParams already did the
+		// decompression that |w| does on the SHORT4 static path.
+		dev->SetTransform(D3DTS_WORLD, &world_c8);
+		dev->SetTransform(D3DTS_VIEW, &view);
+		dev->SetTransform(D3DTS_PROJECTION, &proj);
+		dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+
+		if (diffuse_stage != 0)
+		{
+			dev->GetTexture(static_cast<DWORD>(diffuse_stage), &diffuse);
+			dev->SetTexture(0, diffuse);
+		}
+		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+
+		// out[0] holds source vertex `first`, so shift the base by -MinVertexIndex.
+		const HRESULT hr = dev->DrawIndexedPrimitive(PrimitiveType,
+			static_cast<INT>(-static_cast<INT>(MinVertexIndex)), 0, NumVertices,
+			startIndex, primCount);
+
+		// ---- restore -----------------------------------------------------
+		if (diffuse_stage != 0) { dev->SetTexture(0, old_tex0); if (diffuse) diffuse->Release(); }
+		if (old_tex0) old_tex0->Release();
+		dev->SetRenderState(D3DRS_LIGHTING, old_lighting);
+		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, old_fill);
+		dev->SetStreamSource(0, old_s0, old_s0_off, old_s0_stride);
+		if (old_s0) old_s0->Release();
+		dev->SetVertexShader(old_vs); if (old_vs) old_vs->Release();
+		dev->SetPixelShader(old_ps); if (old_ps) old_ps->Release();
+		dev->SetVertexDeclaration(old_decl); if (old_decl) old_decl->Release();
+
+		if (SUCCEEDED(hr)) { g_veg.trunk_converted++; g_rej.converted++; return true; }
+		return false;
+	}
+
+	// ---- vegetation leaves: morphing billboards + wind -> static geometry ----
+	static bool try_render_leaves(IDirect3DDevice9* dev, const leaf_decl& ld,
+		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
+		UINT NumVertices, UINT startIndex, UINT primCount)
+	{
+		IDirect3DPixelShader9* cur_ps = nullptr;
+		dev->GetPixelShader(&cur_ps);
+		const int diffuse_stage = get_ps_diffuse_stage(cur_ps);
+
+		// Leaf cards are ALPHA-TESTED, and the game does that test inside the pixel
+		// shader against g_AlphaTestValue (PS c31) - which the FF pipeline cannot
+		// run. Without reproducing it every leaf becomes an opaque quad and the tree
+		// turns into a blob. Read the game's own threshold; fall back to a half-way
+		// reference rather than disabling the test (an opaque canopy is far worse
+		// than a slightly wrong cutoff).
+		float atest[4] = { 0.5f, 0, 0, 0 };
+		if (!cur_ps || FAILED(dev->GetPixelShaderConstantF(31, atest, 1)))
+			atest[0] = 0.5f;
+		if (cur_ps) cur_ps->Release();
+		if (diffuse_stage < 0) { g_veg.leaf_no_diffuse++; return false; }
+
+		D3DXMATRIX wvp_t, wvp, world_c8, view, proj;
+		if (!read_vs_const(dev, 0, reinterpret_cast<float*>(&wvp_t), 4))
+		{
+			g_veg.leaf_no_camera++; return false;
+		}
+		D3DXMatrixTranspose(&wvp, &wvp_t);
+		if (!compute_camera(dev, wvp, world_c8, view, proj))
+		{
+			g_veg.leaf_no_camera++; return false;
+		}
+
+		leaf_consts lc;
+		if (!read_leaf_consts(dev, world_c8, lc)) { g_veg.leaf_no_const++; return false; }
+
+		const UINT first = static_cast<UINT>(BaseVertexIndex) + MinVertexIndex;
+		const UINT bytes = NumVertices * sizeof(ff_vertex);
+
+		IDirect3DVertexBuffer9* dyn = get_dynamic_vb(dev, bytes);
+		if (!dyn) { g_veg.leaf_no_vb++; return false; }
+
+		void* dst = nullptr;
+		if (FAILED(dyn->Lock(0, bytes, &dst, D3DLOCK_DISCARD)) || !dst)
+		{
+			g_veg.leaf_no_vb++; return false;
+		}
+
+		bool need[MAX_STREAMS]{};
+		need[ld.base_stream] = true;
+		need[ld.corner_stream] = true;
+		need[ld.dir_stream] = true;
+		need[ld.scale_stream] = true;
+
+		const bool converted = with_stream_mask(dev, need, [&](const vtx_streams& s)
+		{
+			ff_vertex* out = static_cast<ff_vertex*>(dst);
+			for (UINT i = 0; i < NumVertices; ++i)
+				decode_leaf_vertex(s, first + i, ld, lc, out[i]);
+			return true;
+		});
+		dyn->Unlock();
+		if (!converted) { g_veg.leaf_no_vb++; return false; }
+
+		// ---- save what we touch ------------------------------------------
+		IDirect3DVertexShader9* old_vs = nullptr; IDirect3DPixelShader9* old_ps = nullptr;
+		IDirect3DVertexDeclaration9* old_decl = nullptr;
+		dev->GetVertexShader(&old_vs); dev->GetPixelShader(&old_ps); dev->GetVertexDeclaration(&old_decl);
+		DWORD old_lighting = 0, old_fill = 0, old_atest = 0, old_aref = 0, old_afunc = 0;
+		dev->GetRenderState(D3DRS_LIGHTING, &old_lighting);
+		dev->GetRenderState(D3DRS_FILLMODE, &old_fill);
+		dev->GetRenderState(D3DRS_ALPHATESTENABLE, &old_atest);
+		dev->GetRenderState(D3DRS_ALPHAREF, &old_aref);
+		dev->GetRenderState(D3DRS_ALPHAFUNC, &old_afunc);
+		DWORD old_aop = 0, old_aarg1 = 0;
+		dev->GetTextureStageState(0, D3DTSS_ALPHAOP, &old_aop);
+		dev->GetTextureStageState(0, D3DTSS_ALPHAARG1, &old_aarg1);
+		IDirect3DBaseTexture9* old_tex0 = nullptr; dev->GetTexture(0, &old_tex0);
+		IDirect3DBaseTexture9* diffuse = nullptr;
+		IDirect3DVertexBuffer9* old_s0 = nullptr; UINT old_s0_off = 0, old_s0_stride = 0;
+		dev->GetStreamSource(0, &old_s0, &old_s0_off, &old_s0_stride);
+
+		dev->SetVertexShader(nullptr);
+		dev->SetPixelShader(nullptr);
+		dev->SetFVF(FF_FVF);
+		dev->SetStreamSource(0, dyn, 0, sizeof(ff_vertex));
+
+		dev->SetTransform(D3DTS_WORLD, &world_c8);
+		dev->SetTransform(D3DTS_VIEW, &view);
+		dev->SetTransform(D3DTS_PROJECTION, &proj);
+		dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+
+		if (diffuse_stage != 0)
+		{
+			dev->GetTexture(static_cast<DWORD>(diffuse_stage), &diffuse);
+			dev->SetTexture(0, diffuse);
+		}
+		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+
+		// Reproduce the shader's alpha test with fixed-function state.
+		float ref = atest[0];
+		if (!(ref >= 0.0f && ref <= 1.0f)) ref = 0.5f;   // NaN/garbage-proof
+		dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+		dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+		dev->SetRenderState(D3DRS_ALPHAREF, static_cast<DWORD>(ref * 255.0f));
+
+		const HRESULT hr = dev->DrawIndexedPrimitive(PrimitiveType,
+			static_cast<INT>(-static_cast<INT>(MinVertexIndex)), 0, NumVertices,
+			startIndex, primCount);
+
+		// ---- restore -----------------------------------------------------
+		if (diffuse_stage != 0) { dev->SetTexture(0, old_tex0); if (diffuse) diffuse->Release(); }
+		if (old_tex0) old_tex0->Release();
+		dev->SetRenderState(D3DRS_LIGHTING, old_lighting);
+		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, old_fill);
+		dev->SetRenderState(D3DRS_ALPHATESTENABLE, old_atest);
+		dev->SetRenderState(D3DRS_ALPHAREF, old_aref);
+		dev->SetRenderState(D3DRS_ALPHAFUNC, old_afunc);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAOP, old_aop);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, old_aarg1);
+		dev->SetStreamSource(0, old_s0, old_s0_off, old_s0_stride);
+		if (old_s0) old_s0->Release();
+		dev->SetVertexShader(old_vs); if (old_vs) old_vs->Release();
+		dev->SetPixelShader(old_ps); if (old_ps) old_ps->Release();
+		dev->SetVertexDeclaration(old_decl); if (old_decl) old_decl->Release();
+
+		if (SUCCEEDED(hr)) { g_veg.leaf_converted++; g_rej.converted++; return true; }
+		return false;
 	}
 
 	// ---- skinned characters: CPU skin -> plain static geometry ---------------
@@ -1175,7 +2381,30 @@ namespace comp::ac2_ff
 		return false;
 	}
 
+	// Thin wrapper: attribute the draw's outcome to its vertex shader. It wraps
+	// rather than instrumenting the impl because the impl has ~15 return points, and
+	// any one of them missed would silently under-count a rejection - which is the
+	// exact failure this table exists to catch.
+	static bool try_render_fixed_function_impl(IDirect3DDevice9* dev,
+		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
+		UINT NumVertices, UINT startIndex, UINT primCount);
+
 	bool try_render_fixed_function(IDirect3DDevice9* dev,
+		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
+		UINT NumVertices, UINT startIndex, UINT primCount)
+	{
+		if (!g_enabled || !dev || BaseVertexIndex < 0) return false;
+
+		IDirect3DVertexShader9* vs = nullptr;
+		dev->GetVertexShader(&vs);
+		const bool ok = try_render_fixed_function_impl(dev, PrimitiveType, BaseVertexIndex,
+			MinVertexIndex, NumVertices, startIndex, primCount);
+		note_vs_draw(vs, ok);
+		if (vs) vs->Release();
+		return ok;
+	}
+
+	static bool try_render_fixed_function_impl(IDirect3DDevice9* dev,
 		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
 		UINT NumVertices, UINT startIndex, UINT primCount)
 	{
@@ -1206,6 +2435,43 @@ namespace comp::ac2_ff
 			{
 				return true;
 			}
+
+			// Vegetation has no POSITION element at all - the geometry is generated
+			// in the VS from a compressed skeleton. Which family this is comes from
+			// the VS constant table (registered at CreateVertexShader), not from a
+			// draw-time guess.
+			{
+				IDirect3DVertexShader9* vs = nullptr;
+				dev->GetVertexShader(&vs);
+				const veg_kind vk = get_vs_veg(vs);
+				if (vs) vs->Release();
+
+				if (vk != veg_kind::none)
+				{
+					g_veg.seen[static_cast<int>(vk)]++;
+					if (vk == veg_kind::trunk && g_veg_trunks)
+					{
+						const veg_decl vd = classify_veg(el, n);
+						if (!vd.ok) g_veg.trunk_no_decl++;
+						else if (try_render_trunk(dev, vd, PrimitiveType, BaseVertexIndex,
+							MinVertexIndex, NumVertices, startIndex, primCount))
+						{
+							return true;
+						}
+					}
+					else if (vk == veg_kind::leaves && g_veg_leaves)
+					{
+						const leaf_decl ld = classify_leaves(el, n);
+						if (!ld.ok) g_veg.leaf_no_decl++;
+						else if (try_render_leaves(dev, ld, PrimitiveType, BaseVertexIndex,
+							MinVertexIndex, NumVertices, startIndex, primCount))
+						{
+							return true;
+						}
+					}
+				}
+			}
+
 			note_rejected(el, n);
 			g_rej.not_static++;
 			return false;
@@ -1216,13 +2482,25 @@ namespace comp::ac2_ff
 		// pass - leave it to the game rather than forcing its texture out opaque.
 		IDirect3DPixelShader9* cur_ps = nullptr;
 		dev->GetPixelShader(&cur_ps);
-		const int diffuse_stage = get_ps_diffuse_stage(cur_ps);
+		const ps_diffuse_info ps_info = get_ps_diffuse_info(cur_ps);
 		if (cur_ps) cur_ps->Release();
+		int diffuse_stage = ps_info.stage;
+
+		// Normal-only materials (water / volume fog) have no albedo at all. They are
+		// real surfaces, not AO passes, so they convert - but behind a toggle, since
+		// what Remix does with them depends on rtx.conf tagging.
+		if (ps_info.normal_only)
+		{
+			if (!g_normal_only_materials) { g_rej.no_diffuse++; return false; }
+			g_normal_only_draws++;
+		}
 		if (diffuse_stage < 0) { g_rej.no_diffuse++; return false; }
 
+		// The POSITION stream (which is NOT always stream 0) drives the |w| scale and
+		// the static/dynamic decision.
 		IDirect3DVertexBuffer9* src = nullptr;
 		UINT soff = 0, stride = 0;
-		if (FAILED(dev->GetStreamSource(0, &src, &soff, &stride)) || !src || !stride)
+		if (FAILED(dev->GetStreamSource(di.pos_stream, &src, &soff, &stride)) || !src || !stride)
 		{
 			if (src) src->Release();
 			g_rej.no_stream++;
@@ -1239,14 +2517,18 @@ namespace comp::ac2_ff
 			src->Release(); g_rej.no_scale_or_vb++; return false;
 		}
 
-		// Dynamic source (cloth/softbody: re-simulated and re-uploaded every frame)
-		// must NOT use the cached shadow VB - caching freezes it at frame one, so it
-		// renders but never follows the character. Convert it fresh each draw.
+		// The cached shadow VB is a 1:1 copy of ONE source buffer, keyed on that
+		// buffer's pointer, so it can only serve declarations whose attributes all
+		// live on stream 0. A multi-stream declaration has to be gathered per draw.
+		//
+		// Dynamic sources (cloth/softbody: re-simulated and re-uploaded every frame)
+		// must not use the cache either - caching freezes them at frame one, so they
+		// render but never follow the character.
 		IDirect3DVertexBuffer9* vb_to_draw = nullptr;
 		UINT draw_base = BaseVertexIndex;
 		UINT draw_minv = MinVertexIndex;
 
-		if (is_dynamic_vb(src))
+		if (!di.single_stream0 || is_dynamic_vb(src))
 		{
 			const UINT bytes = NumVertices * sizeof(ff_vertex);
 			IDirect3DVertexBuffer9* dyn = get_dynamic_vb(dev, bytes);
@@ -1257,15 +2539,19 @@ namespace comp::ac2_ff
 			{
 				src->Release(); g_rej.no_scale_or_vb++; return false;
 			}
-			const UINT w = convert_range(src, stride, di, first, NumVertices,
-				static_cast<ff_vertex*>(dst));
+			const bool converted = with_streams(dev, di, [&](const vtx_streams& s)
+			{
+				return convert_range(s, di, first, NumVertices,
+					static_cast<ff_vertex*>(dst)) != 0;
+			});
 			dyn->Unlock();
-			if (!w) { src->Release(); g_rej.no_scale_or_vb++; return false; }
+			if (!converted) { src->Release(); g_rej.no_scale_or_vb++; return false; }
 
 			// We compacted [first, first+NumVertices) to out[0..], so shift the base.
 			vb_to_draw = dyn;
 			draw_base = static_cast<UINT>(-static_cast<INT>(MinVertexIndex));
 			draw_minv = 0;
+			g_rej.multistream++;
 		}
 		else
 		{
@@ -1420,11 +2706,16 @@ namespace comp::ac2_ff
 		dev->GetPixelShader(&old_ps);
 		dev->GetVertexDeclaration(&old_decl);
 
-		DWORD old_lighting = 0, old_fill = 0, old_bias = 0, old_sbias = 0;
+		// We bind our converted buffer to STREAM 0, but `src` is the POSITION stream,
+		// which may be stream 1. Restoring stream 0 from `src` would then rebind the
+		// wrong buffer and corrupt the next draw, so save stream 0's real binding.
+		IDirect3DVertexBuffer9* old_s0 = nullptr;
+		UINT old_s0_off = 0, old_s0_stride = 0;
+		dev->GetStreamSource(0, &old_s0, &old_s0_off, &old_s0_stride);
+
+		DWORD old_lighting = 0, old_fill = 0;
 		dev->GetRenderState(D3DRS_LIGHTING, &old_lighting);
 		dev->GetRenderState(D3DRS_FILLMODE, &old_fill);
-		dev->GetRenderState(D3DRS_DEPTHBIAS, &old_bias);
-		dev->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &old_sbias);
 
 		// ---- fixed function ---------------------------------------------
 		dev->SetVertexShader(nullptr);
@@ -1439,16 +2730,6 @@ namespace comp::ac2_ff
 		dev->SetRenderState(D3DRS_LIGHTING, FALSE);
 		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
 
-		// Even with exact matrices, FF concatenates W*V*P itself while the game's
-		// shader uses a pre-multiplied WVP - they differ by ~1 ULP, which is
-		// enough to z-fight coplanar decals we don't convert. Nudging converted
-		// geometry very slightly away lets the decals win consistently.
-		if (g_depth_bias != 0.0f)
-		{
-			const float b = g_depth_bias;
-			dev->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&b));
-		}
-
 		// Bind the real diffuse into stage 0 (it may live at any stage).
 		IDirect3DBaseTexture9* diffuse = nullptr;
 		IDirect3DBaseTexture9* old_tex0 = nullptr;
@@ -1457,6 +2738,109 @@ namespace comp::ac2_ff
 		{
 			dev->GetTexture(static_cast<DWORD>(diffuse_stage), &diffuse);
 			dev->SetTexture(0, diffuse);
+		}
+
+		// ---- texture/sampler diagnostic (see tex_diag in the header) --------
+		// Read the sampler state the GAME left behind, before FF samples with it.
+		// Our SetTexture above does not touch sampler state, so reading it here
+		// is the same as reading it before the bind - and this is the only place
+		// that has both stage numbers and the resolved texture in hand.
+		{
+			// Describe a texture without QueryInterface (the IID lives in
+			// dxguid.lib, which we don't link) and without a refcount.
+			const auto desc_of = [](IDirect3DBaseTexture9* t, UINT& w, UINT& h,
+				DWORD& levels, DWORD& fmt) -> bool
+			{
+				if (!t || t->GetType() != D3DRTYPE_TEXTURE) return false;
+				D3DSURFACE_DESC sd{};
+				if (FAILED(static_cast<IDirect3DTexture9*>(t)->GetLevelDesc(0, &sd))) return false;
+				w = sd.Width; h = sd.Height;
+				levels = t->GetLevelCount(); fmt = sd.Format;
+				return true;
+			};
+
+			const ps_diffuse_info info = get_ps_diffuse_info(cur_ps);
+
+			// ---- histogram over EVERY converted draw, split by rank ----------
+			// n=2 can't tell "tiny is typical" from "I sampled two odd draws".
+			{
+				IDirect3DBaseTexture9* eff = diffuse ? diffuse : old_tex0;
+				UINT w = 0, h = 0; DWORD lv = 0, fm = 0;
+				if (desc_of(eff, w, h, lv, fm))
+				{
+					const int r = (info.rank >= 0 && info.rank <= 4) ? info.rank : 5;
+					const int b = (w <= 8) ? 0 : (w <= 32) ? 1 : (w <= 64) ? 2 : (w <= 128) ? 3
+						: (w <= 256) ? 4 : (w <= 512) ? 5 : 6;
+					g_diffuse_sizes.by_rank[r][b]++;
+					g_diffuse_sizes.rank_total[r]++;
+				}
+			}
+
+			const int slot = (diffuse_stage != 0) ? 1 : 0;
+			if (s_tex_diag_armed[slot])
+			{
+				s_tex_diag_armed[slot] = false;
+				tex_diag d{};
+				d.diffuse_stage = diffuse_stage;
+				d.rank = info.rank;
+				std::strncpy(d.name, info.name, sizeof(d.name) - 1);
+
+				// What was bound at every OTHER stage? A big texture sitting at a
+				// stage we skipped is the whole diagnosis, visible at a glance.
+				for (DWORD s = 0; s < 8; ++s)
+				{
+					IDirect3DBaseTexture9* st = nullptr;
+					if (FAILED(dev->GetTexture(s, &st)) || !st) continue;
+					// Stage 0 already holds OUR bind at this point; report what the
+					// GAME had there instead, or the row would describe ourselves.
+					IDirect3DBaseTexture9* show = (s == 0 && diffuse_stage != 0) ? old_tex0 : st;
+					auto& row = d.stages[s];
+					row.bound = desc_of(show, row.width, row.height, row.levels, row.format);
+					st->Release();
+				}
+
+				const auto read_samp = [&](DWORD stage, tex_diag::samp& s)
+				{
+					DWORD v = 0;
+					dev->GetSamplerState(stage, D3DSAMP_MAXMIPLEVEL, &v);   s.max_mip_level = v;
+					dev->GetSamplerState(stage, D3DSAMP_MIPFILTER, &v);     s.mip_filter = v;
+					dev->GetSamplerState(stage, D3DSAMP_MINFILTER, &v);     s.min_filter = v;
+					dev->GetSamplerState(stage, D3DSAMP_MAGFILTER, &v);     s.mag_filter = v;
+					dev->GetSamplerState(stage, D3DSAMP_MIPMAPLODBIAS, &v);
+					s.mip_lod_bias = *reinterpret_cast<const float*>(&v);   // stored as a float bitpattern
+				};
+				read_samp(static_cast<DWORD>(diffuse_stage), d.src);
+				read_samp(0, d.dst);
+
+				// When the diffuse is already at stage 0 we never fetched it - the
+				// texture under test is then whatever the game had bound there.
+				IDirect3DBaseTexture9* eff = diffuse ? diffuse : old_tex0;
+				if (eff)
+				{
+					d.have_tex = true;
+					d.tex_lod = eff->GetLOD();
+					d.tex_levels = eff->GetLevelCount();
+
+					// GetType() rather than QueryInterface: the IID lives in
+					// dxguid.lib which we don't link, and this needs no refcount.
+					// Cubes/volumes have no GetLevelDesc(0) with this signature.
+					if (eff->GetType() == D3DRTYPE_TEXTURE)
+					{
+						auto* t2d = static_cast<IDirect3DTexture9*>(eff);
+						D3DSURFACE_DESC sd{};
+						if (SUCCEEDED(t2d->GetLevelDesc(0, &sd)))
+						{
+							d.tex_width = sd.Width;
+							d.tex_height = sd.Height;
+							d.tex_pool = sd.Pool;
+							d.tex_format = sd.Format;
+						}
+					}
+				}
+
+				d.valid = true;
+				g_tex_diag[slot] = d;
+			}
 		}
 
 		// unlit, straight texture
@@ -1478,12 +2862,8 @@ namespace comp::ac2_ff
 		if (old_tex0) old_tex0->Release();
 		dev->SetRenderState(D3DRS_LIGHTING, old_lighting);
 		if (g_wireframe) dev->SetRenderState(D3DRS_FILLMODE, old_fill);
-		if (g_depth_bias != 0.0f)
-		{
-			dev->SetRenderState(D3DRS_DEPTHBIAS, old_bias);
-			dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, old_sbias);
-		}
-		dev->SetStreamSource(0, src, soff, stride);
+		dev->SetStreamSource(0, old_s0, old_s0_off, old_s0_stride);
+		if (old_s0) old_s0->Release();
 		if (old_decl) { dev->SetVertexDeclaration(old_decl); old_decl->Release(); }
 		dev->SetVertexShader(old_vs);
 		dev->SetPixelShader(old_ps);
