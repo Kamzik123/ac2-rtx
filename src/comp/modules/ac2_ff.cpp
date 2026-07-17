@@ -9,6 +9,8 @@ namespace comp::ac2_ff
 	bool g_wireframe = false;
 	bool g_ff_only = true;   // INSERT toggles OFF; default ON
 	bool g_skinning = true;
+	bool g_skin_vertex_capture = false;   // F3: skinned -> Remix vertex capture
+	bool g_skin_passthrough = false;      // per-draw signal (see ac2_ff.hpp)
 	bool g_veg_trunks = true;
 	bool g_veg_leaves = true;
 	bool g_normal_only_materials = true;
@@ -905,6 +907,41 @@ namespace comp::ac2_ff
 			return s;
 		}
 
+		// ---- parsed-declaration cache ----------------------------------------
+		// GetDeclaration() copies the element array and classify()/classify_skinned()
+		// re-parse it - individually cheap, but on EVERY draw (~5k/frame) it was a
+		// large slice of our frame time. Declarations are immutable and there are
+		// only ~185 of them, so parse each ONCE keyed by its pointer. AddRef the key:
+		// D3D recycles released-object addresses, so a raw pointer could otherwise
+		// start aliasing a different declaration.
+		struct decl_cache_entry
+		{
+			D3DVERTEXELEMENT9 el[MAX_FVF_DECL_SIZE];
+			UINT       n = 0;
+			decl_info  di;
+			skin_info  si;
+		};
+		std::map<IDirect3DVertexDeclaration9*, decl_cache_entry> s_decl_cache;
+
+		const decl_cache_entry* get_decl_cache(IDirect3DVertexDeclaration9* decl)
+		{
+			{
+				std::lock_guard<std::mutex> lk(s_mutex);
+				auto it = s_decl_cache.find(decl);
+				if (it != s_decl_cache.end()) return &it->second;
+			}
+			decl_cache_entry e{};
+			if (FAILED(decl->GetDeclaration(e.el, &e.n)) || !e.n) return nullptr;
+			e.di = classify(e.el, e.n);
+			e.si = classify_skinned(e.el, e.n);
+
+			std::lock_guard<std::mutex> lk(s_mutex);
+			auto it = s_decl_cache.find(decl);
+			if (it != s_decl_cache.end()) return &it->second;   // lost a race; reuse
+			decl->AddRef();                                     // keep this pointer ours
+			return &s_decl_cache.emplace(decl, e).first->second;
+		}
+
 		constexpr UINT MAX_BONES = 42;   // 126 regs / 3, and (256-120)/3 confirms it
 
 		// Bone palette rows as uploaded: c120+3i, c121+3i, c122+3i are the three
@@ -963,7 +1000,9 @@ namespace comp::ac2_ff
 		}
 
 		// What ARE the draws we reject? Record their declarations.
-		std::map<std::string, std::uint32_t> s_rejected_fmts;
+		// hash(elements) -> { human format string, draw count }. Keyed by hash so
+		// note_rejected() never rebuilds the string for an already-seen format.
+		std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> s_rejected_fmts;
 
 		const char* dtype_name(BYTE t)
 		{
@@ -1014,16 +1053,32 @@ namespace comp::ac2_ff
 		// feeding POSITION from somewhere in the declaration.
 		void note_rejected(const D3DVERTEXELEMENT9* e, UINT n)
 		{
+			// Runs for EVERY not_static draw (~2000/frame). The old code built a
+			// std::string (many heap allocations) every time, even for formats
+			// already in the table - a real per-draw cost. Hash the elements first
+			// and only build the string when a genuinely new format appears.
+			std::uint32_t h = 2166136261u;   // FNV-1a
+			UINT cnt = 0;
+			for (UINT i = 0; i < n && e[i].Stream != 0xFF; ++i, ++cnt)
+			{
+				const auto* b = reinterpret_cast<const std::uint8_t*>(&e[i]);
+				for (std::size_t k = 0; k < sizeof(D3DVERTEXELEMENT9); ++k) { h ^= b[k]; h *= 16777619u; }
+			}
+			if (!cnt) return;
+
+			std::lock_guard<std::mutex> lk(s_mutex);
+			auto it = s_rejected_fmts.find(h);
+			if (it != s_rejected_fmts.end()) { it->second.second++; return; }   // known: cheap
+			if (s_rejected_fmts.size() >= 64) return;                           // table full
+
 			std::string s;
-			for (UINT i = 0; i < n && e[i].Stream != 0xFF; ++i)
+			for (UINT i = 0; i < cnt; ++i)
 			{
 				s += "[s" + std::to_string(e[i].Stream)
 					+ " +" + std::to_string(e[i].Offset) + " " + dtype_name(e[i].Type)
 					+ " " + dusage_name(e[i].Usage) + std::to_string(e[i].UsageIndex) + "]";
 			}
-			if (s.empty()) return;
-			std::lock_guard<std::mutex> lk(s_mutex);
-			if (s_rejected_fmts.size() < 64 || s_rejected_fmts.count(s)) s_rejected_fmts[s]++;
+			s_rejected_fmts[h] = { std::move(s), 1 };
 		}
 
 		// Shared by the static and skinned paths: recover World (c8) and a stable
@@ -1036,6 +1091,19 @@ namespace comp::ac2_ff
 			if (!read_vs_const(dev, 8, reinterpret_cast<float*>(&w_t), 4))
 				return false;
 			D3DXMatrixTranspose(&world_c8, &w_t);
+
+			// Fast path: forward-check the cached pass camera (World * VP_cached ==
+			// WVP) instead of inverting World every draw. Same optimisation as the
+			// main static FF path - the inverse now runs only on a camera change.
+			{
+				std::lock_guard<std::mutex> lk(s_cam_mtx);
+				if (s_cam_valid)
+				{
+					D3DXMATRIX check;
+					D3DXMatrixMultiply(&check, &world_c8, &s_cam_vp);
+					if (same_vp(check, wvp)) { view = s_cam_view; proj = s_cam_proj; return true; }
+				}
+			}
 
 			D3DXMATRIX w_inv, vp_true;
 			float wdet = 0.0f;
@@ -1214,10 +1282,88 @@ namespace comp::ac2_ff
 	// Returns the vertex count written, or 0 on failure. Output is indexed the
 	// same as the source (index i -> vertex i), so the caller keeps the game's
 	// index buffer and BaseVertexIndex.
+	// ---- decoded bind-pose cache (skinning) ------------------------------
+	// A skinned mesh's source VB holds the STATIC bind pose + blend indices/weights;
+	// only the bone palette (c120+) animates. The old code Locked the source VB and
+	// re-decoded every SHORT4N/UBYTE4 vertex EVERY frame for every character - a
+	// per-frame Lock on a GPU-resident buffer (the ~20us/draw stall) plus redundant
+	// decode. Decode ONCE, keyed by (src VB, first, count); each frame only run the
+	// bone blend from the cache.
+	struct skin_src_vtx
+	{
+		float px, py, pz;      // position (already * 16/32768)
+		float nx, ny, nz;      // bind-pose normal
+		float u, v;            // uv
+		std::uint8_t idx[4];   // blend indices
+		float wgt[4];          // blend weights (/255)
+	};
+	struct skin_src_entry { std::vector<skin_src_vtx> v; };
+	// key = { src VB, (first<<32)|count }
+	std::map<std::pair<IDirect3DVertexBuffer9*, std::uint64_t>, skin_src_entry> s_skin_src_cache;
+
+	const skin_src_entry* get_skin_src(IDirect3DVertexBuffer9* src, UINT stride,
+		const skin_info& si, UINT first, UINT count)
+	{
+		const auto key = std::make_pair(src,
+			(static_cast<std::uint64_t>(first) << 32) | count);
+		{
+			std::lock_guard<std::mutex> lk(s_mutex);
+			auto it = s_skin_src_cache.find(key);
+			if (it != s_skin_src_cache.end()) return &it->second;
+		}
+
+		void* data = nullptr;
+		if (FAILED(src->Lock(0, 0, &data, D3DLOCK_READONLY)) || !data) return nullptr;
+		const auto* base = static_cast<const std::uint8_t*>(data);
+
+		skin_src_entry e;
+		e.v.resize(count);
+		const float kp = 16.0f / 32768.0f;
+		for (UINT i = 0; i < count; ++i)
+		{
+			const auto* p = base + static_cast<std::size_t>(stride) * (first + i);
+			skin_src_vtx& o = e.v[i];
+
+			std::int16_t ps[4];
+			memcpy(ps, p + si.pos_off, sizeof(ps));
+			o.px = ps[0] * kp; o.py = ps[1] * kp; o.pz = ps[2] * kp;
+
+			if (si.has_nrm)
+			{
+				const auto* nb = p + si.nrm_off;
+				o.nx = (nb[0] - 127.0f) * (1.0f / 127.0f);
+				o.ny = (nb[1] - 127.0f) * (1.0f / 127.0f);
+				o.nz = (nb[2] - 127.0f) * (1.0f / 127.0f);
+			}
+			else { o.nx = 0.0f; o.ny = 1.0f; o.nz = 0.0f; }
+
+			if (si.has_uv)
+			{
+				std::int16_t t[2];
+				memcpy(t, p + si.uv_off, sizeof(t));
+				o.u = t[0] * UV_SHORT2N_SCALE; o.v = t[1] * UV_SHORT2N_SCALE;
+			}
+			else { o.u = 0.0f; o.v = 0.0f; }
+
+			const std::uint8_t* ib = p + si.idx_off;
+			const std::uint8_t* wb = p + si.wgt_off;
+			for (int j = 0; j < 4; ++j) { o.idx[j] = ib[j]; o.wgt[j] = wb[j] * (1.0f / 255.0f); }
+		}
+		src->Unlock();
+
+		std::lock_guard<std::mutex> lk(s_mutex);
+		auto it = s_skin_src_cache.find(key);
+		if (it != s_skin_src_cache.end()) return &it->second;   // lost a race
+		src->AddRef();   // keep the pointer ours (D3D recycles released addresses)
+		return &s_skin_src_cache.emplace(key, std::move(e)).first->second;
+	}
+
 	static UINT skin_to_buffer(IDirect3DDevice9* dev, IDirect3DVertexBuffer9* src,
 		UINT stride, const skin_info& si, UINT first, UINT count, ff_vertex* out)
 	{
-		// Palette: c120..c245 = 42 bones x 3 registers (4x3 transposed).
+		// Palette: c120..c245 = 42 bones x 3 registers (4x3 transposed). This is the
+		// ONLY thing that changes per frame, so it is all we read each frame; the
+		// bind-pose vertices come from the decode cache above.
 		static thread_local D3DXVECTOR4 regs[MAX_BONES * 3];
 		const bool had_all = read_vs_const(dev, 120, reinterpret_cast<float*>(regs), MAX_BONES * 3);
 		if (!had_all)
@@ -1228,58 +1374,38 @@ namespace comp::ac2_ff
 				return 0;
 		}
 
-		void* data = nullptr;
-		if (FAILED(src->Lock(0, 0, &data, D3DLOCK_READONLY)) || !data) return 0;
-		const auto* base = static_cast<const std::uint8_t*>(data);
+		const skin_src_entry* se = get_skin_src(src, stride, si, first, count);
+		if (!se || se->v.size() != count) return 0;
 
 		for (UINT v = 0; v < count; ++v)
 		{
-			const auto* p = base + static_cast<std::size_t>(stride) * (first + v);
+			const skin_src_vtx& s = se->v[v];
+			ff_vertex& o = out[v];
 
-			std::int16_t ps[4];
-			memcpy(ps, p + si.pos_off, sizeof(ps));
-
-			// SHORT4N: hardware would divide by 32768; then the shader scales by 16.
-			// pos4 = (x*16, y*16, z*16, 1). w is AO, NOT part of the position.
-			const float k = 16.0f / 32768.0f;
-			const D3DXVECTOR4 pos4(ps[0] * k, ps[1] * k, ps[2] * k, 1.0f);
-
-			const std::uint8_t* ib = p + si.idx_off;
-			const std::uint8_t* wb = p + si.wgt_off;
-
-			float nx = 0.0f, ny = 1.0f, nz = 0.0f;
-			if (si.has_nrm)
-			{
-				const std::uint8_t* nb = p + si.nrm_off;
-				nx = (nb[0] - 127.0f) * (1.0f / 127.0f);
-				ny = (nb[1] - 127.0f) * (1.0f / 127.0f);
-				nz = (nb[2] - 127.0f) * (1.0f / 127.0f);
-			}
-			const D3DXVECTOR4 nrm4(nx, ny, nz, 0.0f); // direction: w = 0
-
-			D3DXVECTOR3 sp(0, 0, 0), sn(0, 0, 0);
+			// pos4 = (px, py, pz, 1); nrm4 = (nx, ny, nz, 0). Dot products inlined -
+			// D3DXVec3Normalize was the only out-of-line call and it is now inline too.
+			float spx = 0, spy = 0, spz = 0, snx = 0, sny = 0, snz = 0;
 			for (int j = 0; j < 4; ++j)
 			{
-				const float w = wb[j] * (1.0f / 255.0f); // UBYTE4N
+				const float w = s.wgt[j];
 				if (w <= 0.0f) continue;
-
-				UINT bi = ib[j];
+				UINT bi = s.idx[j];
 				if (bi >= MAX_BONES) bi = 0;
 				const bone_rows& b = *reinterpret_cast<const bone_rows*>(&regs[bi * 3]);
 
-				sp.x += w * D3DXVec4Dot(&pos4, &b.r0);
-				sp.y += w * D3DXVec4Dot(&pos4, &b.r1);
-				sp.z += w * D3DXVec4Dot(&pos4, &b.r2);
-
-				sn.x += w * D3DXVec4Dot(&nrm4, &b.r0);
-				sn.y += w * D3DXVec4Dot(&nrm4, &b.r1);
-				sn.z += w * D3DXVec4Dot(&nrm4, &b.r2);
+				spx += w * (s.px * b.r0.x + s.py * b.r0.y + s.pz * b.r0.z + b.r0.w);
+				spy += w * (s.px * b.r1.x + s.py * b.r1.y + s.pz * b.r1.z + b.r1.w);
+				spz += w * (s.px * b.r2.x + s.py * b.r2.y + s.pz * b.r2.z + b.r2.w);
+				snx += w * (s.nx * b.r0.x + s.ny * b.r0.y + s.nz * b.r0.z);
+				sny += w * (s.nx * b.r1.x + s.ny * b.r1.y + s.nz * b.r1.z);
+				snz += w * (s.nx * b.r2.x + s.ny * b.r2.y + s.nz * b.r2.z);
 			}
 
-			ff_vertex& o = out[v];
-			o.x = sp.x; o.y = sp.y; o.z = sp.z;
-			D3DXVec3Normalize(&sn, &sn);
-			o.nx = sn.x; o.ny = sn.y; o.nz = sn.z;
+			o.x = spx; o.y = spy; o.z = spz;
+			float nl = snx * snx + sny * sny + snz * snz;
+			if (nl > 1e-12f) { const float inv = 1.0f / sqrtf(nl); snx *= inv; sny *= inv; snz *= inv; }
+			o.nx = snx; o.ny = sny; o.nz = snz;
+			o.u = s.u; o.v = s.v;
 
 			// ---- one-shot skin diagnostic (vertex 0 of one real draw) --------
 			if (s_skin_diag_armed && v == 0)
@@ -1288,45 +1414,31 @@ namespace comp::ac2_ff
 					memcpy(g_skin_diag.bones[bn], &regs[bn * 3], 12 * sizeof(float));
 				for (int j = 0; j < 4; ++j)
 				{
-					g_skin_diag.idx[j] = ib[j];
-					g_skin_diag.wgt[j] = wb[j] * (1.0f / 255.0f);
+					g_skin_diag.idx[j] = s.idx[j];
+					g_skin_diag.wgt[j] = s.wgt[j];
 				}
-				g_skin_diag.src_pos[0] = static_cast<float>(ps[0]);
-				g_skin_diag.src_pos[1] = static_cast<float>(ps[1]);
-				g_skin_diag.src_pos[2] = static_cast<float>(ps[2]);
-				g_skin_diag.src_pos[3] = static_cast<float>(ps[3]);
-				g_skin_diag.out_pos[0] = sp.x;
-				g_skin_diag.out_pos[1] = sp.y;
-				g_skin_diag.out_pos[2] = sp.z;
+				g_skin_diag.src_pos[0] = s.px;   // decoded (was raw SHORT), more useful
+				g_skin_diag.src_pos[1] = s.py;
+				g_skin_diag.src_pos[2] = s.pz;
+				g_skin_diag.src_pos[3] = 1.0f;
+				g_skin_diag.out_pos[0] = spx;
+				g_skin_diag.out_pos[1] = spy;
+				g_skin_diag.out_pos[2] = spz;
 				g_skin_diag.shadow_had_all = had_all;
 				g_skin_diag.max_bone_index = 0;
 				g_skin_diag.valid = true;
 				s_skin_diag_capturing = true;   // keep scanning THIS draw only
 				s_skin_diag_armed = false;
 			}
-
-			// max_bone_index must describe the SAME draw as idx[]/bones[]. It used to
-			// reset on v==0 of EVERY draw, so it reported the LAST skinned draw while
-			// idx[] came from the armed one - which read as "max index 1 but vertex 0
-			// uses bone 26" and looked like a real skinning bug. It wasn't.
 			if (s_skin_diag_capturing)
 			{
 				for (int j = 0; j < 4; ++j)
-					if (wb[j] && ib[j] > g_skin_diag.max_bone_index) g_skin_diag.max_bone_index = ib[j];
+					if (s.wgt[j] > 0.0f && s.idx[j] > g_skin_diag.max_bone_index)
+						g_skin_diag.max_bone_index = s.idx[j];
 			}
-
-			if (si.has_uv)
-			{
-				std::int16_t t[2];
-				memcpy(t, p + si.uv_off, sizeof(t));
-				o.u = t[0] * UV_SHORT2N_SCALE;
-				o.v = t[1] * UV_SHORT2N_SCALE;
-			}
-			else { o.u = 0.0f; o.v = 0.0f; }
 		}
 
 		s_skin_diag_capturing = false;   // this draw is done
-		src->Unlock();
 		return count;
 	}
 
@@ -1357,7 +1469,9 @@ namespace comp::ac2_ff
 	void dump_rejected_formats(std::ostream& os)
 	{
 		std::lock_guard<std::mutex> lk(s_mutex);
-		std::vector<std::pair<std::string, std::uint32_t>> v(s_rejected_fmts.begin(), s_rejected_fmts.end());
+		std::vector<std::pair<std::string, std::uint32_t>> v;
+		v.reserve(s_rejected_fmts.size());
+		for (const auto& [hash, fmt] : s_rejected_fmts) v.emplace_back(fmt.first, fmt.second);
 		std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
 		os << "\n---- REJECTED as not_static: what are they? (stream 0) ----\n";
 		for (std::size_t i = 0; i < v.size() && i < 16; ++i)
@@ -2393,6 +2507,7 @@ namespace comp::ac2_ff
 		D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex,
 		UINT NumVertices, UINT startIndex, UINT primCount)
 	{
+		g_skin_passthrough = false;   // reset the per-draw pass-through signal
 		if (!g_enabled || !dev || BaseVertexIndex < 0) return false;
 
 		IDirect3DVertexShader9* vs = nullptr;
@@ -2417,13 +2532,22 @@ namespace comp::ac2_ff
 
 		IDirect3DVertexDeclaration9* decl = nullptr;
 		if (FAILED(dev->GetVertexDeclaration(&decl)) || !decl) { g_rej.no_decl++; return false; }
+		const decl_cache_entry* dce = get_decl_cache(decl);   // GetDeclaration+classify
+		decl->Release();                                      // run once per unique decl
+		if (!dce) { g_rej.no_decl++; return false; }
+		const decl_info& di = dce->di;
+		const skin_info& si = dce->si;
+		const D3DVERTEXELEMENT9* el = dce->el;
+		const UINT n = dce->n;
 
-		D3DVERTEXELEMENT9 el[MAX_FVF_DECL_SIZE]{};
-		UINT n = 0;
-		if (FAILED(decl->GetDeclaration(el, &n)) || !n) { decl->Release(); g_rej.no_decl++; return false; }
-		const decl_info di = classify(el, n);
-		const skin_info si = classify_skinned(el, n);
-		decl->Release();
+		// F3 test: let skinned meshes go to Remix's vertex capture instead of our
+		// CPU skinning. Signal the renderer to pass this draw through the FF-ONLY
+		// drop so the original shader draw actually runs.
+		if (si.ok && g_skin_vertex_capture)
+		{
+			g_skin_passthrough = true;
+			return false;
+		}
 
 		if (!di.ok)
 		{
@@ -2592,6 +2716,30 @@ namespace comp::ac2_ff
 			{
 				D3DXMatrixTranspose(&world_c8, &w_t);
 
+				// Fast path: the camera (View*Proj) is constant across a pass, so
+				// validate the CACHED camera without inverting World. If
+				//     World * VP_cached  ==  WVP
+				// then the cached View/Proj already reproduce this draw's MVP, and we
+				// skip the 4x4 inverse + decompose + verify below. Profiling showed
+				// that per-draw inverse was ~65% of our whole frame; it now runs only
+				// when the camera actually changes (once per pass), not per draw.
+				{
+					std::lock_guard<std::mutex> lk(s_cam_mtx);
+					if (s_cam_valid)
+					{
+						D3DXMATRIX check;
+						D3DXMatrixMultiply(&check, &world_c8, &s_cam_vp);
+						if (same_vp(check, wvp))
+						{
+							D3DXMatrixMultiply(&world, &scale_m, &world_c8);
+							view = s_cam_view;
+							proj = s_cam_proj;
+							g_world_source = world_src::constant_c8;
+							goto matrices_ready;
+						}
+					}
+				}
+
 				D3DXMATRIX w_inv, vp_true;
 				float wdet = 0.0f;
 				if (!D3DXMatrixInverse(&w_inv, &wdet, &world_c8) || fabsf(wdet) <= 1e-20f)
@@ -2759,20 +2907,28 @@ namespace comp::ac2_ff
 				return true;
 			};
 
-			const ps_diffuse_info info = get_ps_diffuse_info(cur_ps);
+			const ps_diffuse_info& info = ps_info;   // reuse the earlier lookup
+			                                         // (cur_ps is already released)
 
-			// ---- histogram over EVERY converted draw, split by rank ----------
-			// n=2 can't tell "tiny is typical" from "I sampled two odd draws".
+			// ---- histogram, sampled 1/256 -----------------------------------
+			// desc_of() calls GetType/GetLevelDesc/GetLevelCount, which are bridge
+			// round-trips; doing it on EVERY converted draw cost ~3 sync round-trips
+			// per draw (thousands per frame). The histogram only needs a sample, so
+			// throttle hard - the distribution shape survives, the stall does not.
 			{
-				IDirect3DBaseTexture9* eff = diffuse ? diffuse : old_tex0;
-				UINT w = 0, h = 0; DWORD lv = 0, fm = 0;
-				if (desc_of(eff, w, h, lv, fm))
+				static std::uint32_t s_hist_sample = 0;
+				if ((s_hist_sample++ & 0xFF) == 0)
 				{
-					const int r = (info.rank >= 0 && info.rank <= 4) ? info.rank : 5;
-					const int b = (w <= 8) ? 0 : (w <= 32) ? 1 : (w <= 64) ? 2 : (w <= 128) ? 3
-						: (w <= 256) ? 4 : (w <= 512) ? 5 : 6;
-					g_diffuse_sizes.by_rank[r][b]++;
-					g_diffuse_sizes.rank_total[r]++;
+					IDirect3DBaseTexture9* eff = diffuse ? diffuse : old_tex0;
+					UINT w = 0, h = 0; DWORD lv = 0, fm = 0;
+					if (desc_of(eff, w, h, lv, fm))
+					{
+						const int r = (info.rank >= 0 && info.rank <= 4) ? info.rank : 5;
+						const int b = (w <= 8) ? 0 : (w <= 32) ? 1 : (w <= 64) ? 2 : (w <= 128) ? 3
+							: (w <= 256) ? 4 : (w <= 512) ? 5 : 6;
+						g_diffuse_sizes.by_rank[r][b]++;
+						g_diffuse_sizes.rank_total[r]++;
+					}
 				}
 			}
 

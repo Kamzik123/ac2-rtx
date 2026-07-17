@@ -7,215 +7,311 @@
 namespace comp::ac2_lights
 {
 	bool  g_enabled = true;
+	bool  g_remix_api = true;    // lights ON by default (HOME toggles); needs
+	                             // exposeRemixApi=True in bridge.conf (already set)
 	float g_radiance_scale = 20.0f;
 	float g_emitter_radius = 0.06f;
 	stats g_stats{};
 
 	namespace
-{
-		// ---- pixel-shader constant shadow -----------------------------------
-		// ps_3_0 has 224 float4 constants; the light block lives at c32..c54.
-		constexpr UINT PS_CONST_MAX = 224;
-		float      s_ps_const[PS_CONST_MAX][4]{};
-		bool       s_ps_const_set[PS_CONST_MAX]{};
-		std::mutex s_const_mtx;   // device is D3DCREATE_MULTITHREADED
+	{
+		// ---- engine addresses / layout (Win32, IDB rebased to 0 => RVAs) -----
+		// scimitar::LightingEnv::Update(this=node+0x90, PtrArray<LightNode>*,
+		// GraphicNode*), __thiscall. Hook point for the whole entity route.
+		constexpr std::uintptr_t RVA_LIGHTING_UPDATE = 0x1269E60;
 
-		bool read_ps_const(UINT start, float* out, UINT count)
+		// Light-struct RTTI magic returned by the virtual at vtable+0x14. These are
+		// class-name hashes, so they are identical on the Mac binary; but the field
+		// OFFSETS below were re-derived on Windows and differ from the Mac ones.
+		constexpr std::uint32_t MAGIC_DIRECT = 0x7E15FD50;   // directional
+		constexpr std::uint32_t MAGIC_OMNI   = 0x344780D6;   // point
+		constexpr std::uint32_t MAGIC_SPOT   = 0x80320FB8;
+		constexpr std::uint32_t MAGIC_SUN    = 0x5EDC3E04;   // shadowed directional
+
+		// LightNode offsets.
+		constexpr std::size_t NODE_MATRIX = 0x40;   // 4x4 float, row-major
+		constexpr std::size_t NODE_ROW1   = 0x50;   // matrix row 1 -> direction
+		constexpr std::size_t NODE_ROW3   = 0x70;   // matrix row 3 -> world position
+		constexpr std::size_t NODE_LIGHT  = 0xA8;   // -> light struct
+
+		// light-struct offsets (bytes).
+		constexpr std::size_t L_INTENSITY     = 0x14;    // [5]
+		constexpr std::size_t L_COLOUR        = 0x10C;   // [67..69] rgb
+		constexpr std::size_t L_ENABLE        = 0x11C;   // u16, bit 0x200
+		constexpr std::size_t L_OMNI_FAR      = 0x124;   // [73]  (near @ [72] +0x120)
+		constexpr std::size_t L_SPOT_CONE_OUT = 0x120;   // [72] radians
+		constexpr std::size_t L_SPOT_CONE_IN  = 0x124;   // [73] radians
+		constexpr std::size_t L_SPOT_FAR      = 0x130;   // [76]  (near @ [75] +0x12C)
+
+		template <typename T>
+		T rd(const void* base, std::size_t off)
 		{
-			if (start + count > PS_CONST_MAX) return false;
-			std::lock_guard<std::mutex> lk(s_const_mtx);
-			for (UINT i = 0; i < count; ++i)
-				if (!s_ps_const_set[start + i]) return false;   // game hasn't written it yet
-			memcpy(out, &s_ps_const[start][0], count * 4 * sizeof(float));
-			return true;
+			return *reinterpret_cast<const T*>(
+				reinterpret_cast<const std::uint8_t*>(base) + off);
 		}
 
-		// ---- per-PS light counts --------------------------------------------
-		struct ps_lights
+		void read3(const void* base, std::size_t off, float out[3])
 		{
-			int  omni = 0, direct = 0, spot = 0;
-			bool sun = false;
-		};
-		std::map<IDirect3DPixelShader9*, ps_lights> s_ps_lights;
+			const auto* p = reinterpret_cast<const float*>(
+				reinterpret_cast<const std::uint8_t*>(base) + off);
+			out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+		}
 
-		// ---- collected lights ------------------------------------------------
-		enum class ltype { omni, spot, direct };
+		void normalize3(float v[3])
+		{
+			const float m = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+			if (m > 1e-8f) { v[0] /= m; v[1] /= m; v[2] /= m; }
+		}
+
+		// ---- collected light --------------------------------------------------
+		enum class ltype { omni, spot, direct, sun };
 
 		struct light
 		{
 			ltype type = ltype::omni;
 			float pos[3]{};
 			float dir[3]{};
-			float colour[3]{};
-			float range = 0.0f;          // metres (sqrt of the stored far^2)
+			float colour[3]{};      // already premultiplied by intensity (see collect)
+			float range = 0.0f;     // metres (far), for the report only
 			float cone_outer_deg = 0.0f;
 			float cone_inner_deg = 0.0f;
 		};
 
-		std::mutex s_mtx;
-		std::map<std::uint64_t, light> s_frame;   // deduped by stable key
-		std::vector<remixapi_LightHandle> s_handles;  // live handles, retired next frame
-		std::map<std::uint64_t, light> s_last_dump;  // snapshot for the report
-
-		// Dedupe/identity key.
-		//
-		// One light lights many objects, so the same light arrives on hundreds of
-		// draws per frame; and Remix needs a light's hash to be STABLE ACROSS FRAMES
-		// or the light is destroyed and recreated every frame, which reads as a
-		// flickering light. AC2's lights (torches, braziers) are essentially static,
-		// so quantised world position + colour is both a good deduper and a stable
-		// identity. Quantise at 1cm - finer than that and float jitter in the
-		// constants would split one light into several.
-		std::uint64_t light_key(const light& l)
+		// ---- lock-free per-thread collection ---------------------------------
+		// LightingEnv::Update runs on the engine's WORKER threads, hundreds of times
+		// per frame. A single shared mutex here serialises those workers and stalls
+		// the whole record phase. Instead each thread accumulates into its OWN bucket
+		// (no cross-thread contention); frame_end drains them all on the render thread.
+		struct tls_bucket
 		{
-			auto q = [](float v) { return static_cast<std::int64_t>(std::lround(v * 100.0f)); };
-			std::uint64_t h = 1469598103934665603ull;   // FNV-1a
-			auto mix = [&h](std::int64_t v)
+			std::mutex mtx;   // only ever contended between its owner thread and the
+			                  // once-per-frame drain, so effectively uncontended
+			std::map<const void*, light> m;
+		};
+		std::mutex s_buckets_mtx;                 // guards the bucket LIST (first touch only)
+		std::vector<tls_bucket*> s_buckets;
+
+		tls_bucket& my_bucket()
+		{
+			thread_local tls_bucket* b = nullptr;
+			if (!b)
 			{
-				const auto* b = reinterpret_cast<const std::uint8_t*>(&v);
-				for (int i = 0; i < 8; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-			};
-			mix(static_cast<std::int64_t>(l.type));
-			mix(q(l.pos[0])); mix(q(l.pos[1])); mix(q(l.pos[2]));
-			// Colour at coarse resolution: a torch that flickers in INTENSITY should
-			// stay ONE light, not spawn a new one per brightness step.
-			mix(static_cast<std::int64_t>(std::lround(l.colour[0])));
-			mix(static_cast<std::int64_t>(std::lround(l.colour[1])));
-			mix(static_cast<std::int64_t>(std::lround(l.colour[2])));
-			if (l.type == ltype::direct)
-			{
-				mix(q(l.dir[0])); mix(q(l.dir[1])); mix(q(l.dir[2]));
+				b = new tls_bucket();
+				std::lock_guard<std::mutex> lk(s_buckets_mtx);
+				s_buckets.push_back(b);
 			}
-			return h;
+			return *b;
 		}
+
+		std::mutex s_mtx;                           // guards s_last_dump only
+		std::map<const void*, light> s_last_dump;
+
+		// ---- persistent light registry ---------------------------------------
+		// Keep a persistent registry and match each frame's lights to it SPATIALLY,
+		// with a tolerance - boundary-free, so a light that jitters by a hair (or
+		// whose node is reallocated) stays the same light. Each entry carries a
+		// stable `id` used as the Remix hash, and is aged
+		// out only after it goes unseen for a few frames, so a one-frame collection
+		// gap (workers still building while Present swaps) does not blink every light.
+		struct reg_entry
+		{
+			light                l;
+			remixapi_LightHandle handle = nullptr;
+			std::uint64_t        id = 0;          // stable Remix hash for this light
+			std::uint32_t        last_seen = 0;   // frame number last matched
+			bool                 dirty = true;    // data changed => recreate handle
+		};
+		std::vector<reg_entry> s_registry;
+		std::uint64_t s_next_id = 1;
+		std::uint32_t s_frame_no = 0;
+
+		// A light survives this many frames without being re-seen before we drop it.
+		constexpr std::uint32_t MAX_AGE = 4;
+		// Spatial match tolerances: 5cm for position, ~11 deg for direction.
+		constexpr float POS_TOL2 = 0.05f * 0.05f;
+		constexpr float DIR_DOT_MIN = 0.98f;
+
+		// pointer-stability diagnostic (informational only)
+		std::vector<const void*> s_prev_ptrs;
 
 		bool is_black(const float* c)
 		{
 			return c[0] <= 1e-4f && c[1] <= 1e-4f && c[2] <= 1e-4f;
 		}
 
-		void add(const light& l)
+		bool is_distant(ltype t) { return t == ltype::direct || t == ltype::sun; }
+
+		// Does registry entry `e` describe the same physical light as `l`?
+		bool same_light(const reg_entry& e, const light& l)
 		{
-			// A zero-radiance light contributes nothing but still costs Remix a light
-			// slot. AC2 leaves disabled slots zeroed, so this is also how we tell a
-			// real light from an unused register.
-			if (is_black(l.colour)) return;
-
-			const auto k = light_key(l);
-			std::lock_guard<std::mutex> lk(s_mtx);
-			s_frame.emplace(k, l);
-		}
-	}
-
-	void on_set_ps_constant_f(UINT start_register, const float* data, UINT vec4_count)
-	{
-		if (!data || start_register >= PS_CONST_MAX) return;
-		const UINT n = (start_register + vec4_count > PS_CONST_MAX)
-			? (PS_CONST_MAX - start_register) : vec4_count;
-
-		std::lock_guard<std::mutex> lk(s_const_mtx);
-		memcpy(&s_ps_const[start_register][0], data, n * 4 * sizeof(float));
-		for (UINT i = 0; i < n; ++i) s_ps_const_set[start_register + i] = true;
-	}
-
-	void register_ps_lights(IDirect3DPixelShader9* ps, int num_omni, int num_direct,
-		int num_spot, bool has_sun)
-	{
-		if (!ps) return;
-		if (!num_omni && !num_direct && !num_spot && !has_sun) return;
-
-		std::lock_guard<std::mutex> lk(s_mtx);
-		auto it = s_ps_lights.find(ps);
-		// AddRef for the same reason ac2_ff does on the diffuse-stage map: D3D
-		// recycles the addresses of released objects (7 confirmed reuses WITH a
-		// different descriptor in one run), so a raw pointer key can silently start
-		// referring to a different shader. Holding a reference keeps the address ours.
-		if (it == s_ps_lights.end()) ps->AddRef();
-		s_ps_lights[ps] = { num_omni, num_direct, num_spot, has_sun };
-		g_stats.ps_with_lights = static_cast<std::uint32_t>(s_ps_lights.size());
-	}
-
-	void on_draw(IDirect3DDevice9* dev)
-	{
-		if (!g_enabled || !dev) return;
-
-		IDirect3DPixelShader9* ps = nullptr;
-		if (FAILED(dev->GetPixelShader(&ps)) || !ps) { if (ps) ps->Release(); return; }
-
-		ps_lights pl;
-		{
-			std::lock_guard<std::mutex> lk(s_mtx);
-			auto it = s_ps_lights.find(ps);
-			if (it == s_ps_lights.end()) { ps->Release(); return; }  // no lights in this PS
-			pl = it->second;
-		}
-		ps->Release();
-
-		g_stats.draws_with_lights++;
-
-		// ---- omni: c32 + 2*i,  reg0 = {pos, far^2}, reg1 = {colour, 1/(f^2-n^2)}
-		for (int i = 0; i < pl.omni && i < 4; ++i)
-		{
-			float r[8];
-			if (!read_ps_const(32 + 2 * i, r, 2)) { g_stats.const_miss++; continue; }
-
-			light l;
-			l.type = ltype::omni;
-			l.pos[0] = r[0]; l.pos[1] = r[1]; l.pos[2] = r[2];
-			l.range = (r[3] > 0.0f) ? sqrtf(r[3]) : 0.0f;    // stored SQUARED
-			l.colour[0] = r[4]; l.colour[1] = r[5]; l.colour[2] = r[6];
-			add(l);
-			g_stats.omni_seen++;
+			if (e.l.type != l.type) return false;
+			if (is_distant(l.type))
+			{
+				const float d = e.l.dir[0] * l.dir[0] + e.l.dir[1] * l.dir[1]
+					+ e.l.dir[2] * l.dir[2];
+				return d >= DIR_DOT_MIN;
+			}
+			const float dx = e.l.pos[0] - l.pos[0];
+			const float dy = e.l.pos[1] - l.pos[1];
+			const float dz = e.l.pos[2] - l.pos[2];
+			return (dx * dx + dy * dy + dz * dz) <= POS_TOL2;
 		}
 
-		// ---- direct: c40 + 2*i, reg0 = {-dir, ?}, reg1 = {colour, 0}
-		for (int i = 0; i < pl.direct && i < 2; ++i)
+		// Has the light data changed enough that Remix needs a fresh handle?
+		bool light_differs(const light& a, const light& b)
 		{
-			float r[8];
-			if (!read_ps_const(40 + 2 * i, r, 2)) { g_stats.const_miss++; continue; }
-
-			light l;
-			l.type = ltype::direct;
-			// The register holds the NEGATED direction (the shader wants a vector
-			// pointing at the light); Remix wants the direction the light travels.
-			l.dir[0] = -r[0]; l.dir[1] = -r[1]; l.dir[2] = -r[2];
-			l.colour[0] = r[4]; l.colour[1] = r[5]; l.colour[2] = r[6];
-			add(l);
-			g_stats.direct_seen++;
+			auto df = [](float x, float y) { return fabsf(x - y) > 1e-3f; };
+			if (df(a.pos[0], b.pos[0]) || df(a.pos[1], b.pos[1]) || df(a.pos[2], b.pos[2]))
+				return true;
+			if (df(a.dir[0], b.dir[0]) || df(a.dir[1], b.dir[1]) || df(a.dir[2], b.dir[2]))
+				return true;
+			if (df(a.colour[0], b.colour[0]) || df(a.colour[1], b.colour[1])
+				|| df(a.colour[2], b.colour[2]))
+				return true;
+			if (df(a.cone_outer_deg, b.cone_outer_deg) || df(a.cone_inner_deg, b.cone_inner_deg))
+				return true;
+			return false;
 		}
 
-		// ---- spot: c44 + 4*i, reg0/1 as omni, reg2 = {-dir,?}, reg3 = cones
-		for (int i = 0; i < pl.spot && i < 2; ++i)
+		// Read one LightNode into `out`. Returns false if it should be skipped.
+		bool decode_node(const void* node, light& out)
 		{
-			float r[16];
-			if (!read_ps_const(44 + 4 * i, r, 4)) { g_stats.const_miss++; continue; }
+			const void* ls = rd<const void*>(node, NODE_LIGHT);
+			if (!ls) return false;
 
-			light l;
-			l.type = ltype::spot;
-			l.pos[0] = r[0]; l.pos[1] = r[1]; l.pos[2] = r[2];
-			l.range = (r[3] > 0.0f) ? sqrtf(r[3]) : 0.0f;
-			l.colour[0] = r[4]; l.colour[1] = r[5]; l.colour[2] = r[6];
-			l.dir[0] = -r[8]; l.dir[1] = -r[9]; l.dir[2] = -r[10];
+			// Enabled bit (bit 9 of the u16 at +0x11C). The engine gates on this
+			// exact bit before submitting a light.
+			if (((rd<std::uint16_t>(ls, L_ENABLE) >> 9) & 1u) == 0) return false;
 
-			// reg3.x/.y are the COSINES of the cone half-angles, so convert back.
-			const float co = (std::max)(-1.0f, (std::min)(1.0f, r[12]));
-			const float ci = (std::max)(-1.0f, (std::min)(1.0f, r[13]));
-			l.cone_outer_deg = acosf(co) * (180.0f / 3.14159265f);
-			l.cone_inner_deg = acosf(ci) * (180.0f / 3.14159265f);
-			add(l);
-			g_stats.spot_seen++;
+			// Type via the same virtual the engine calls: vtable[+0x14](this).
+			const void* vtbl = rd<const void*>(ls, 0);
+			if (!vtbl) return false;
+			using PFN_Type = std::uint32_t(__thiscall*)(const void*);
+			const auto get_type = rd<PFN_Type>(vtbl, 0x14);
+			const std::uint32_t magic = get_type(ls);
+
+			// intensity, colour (colour is premultiplied by intensity here so the
+			// submit path matches the old register decode, which read the already-
+			// premultiplied colour out of reg1).
+			const float intensity = rd<float>(ls, L_INTENSITY);
+			read3(ls, L_COLOUR, out.colour);
+			out.colour[0] *= intensity;
+			out.colour[1] *= intensity;
+			out.colour[2] *= intensity;
+
+			switch (magic)
+			{
+			case MAGIC_OMNI:
+				out.type = ltype::omni;
+				read3(node, NODE_ROW3, out.pos);
+				out.range = rd<float>(ls, L_OMNI_FAR);   // far (linear, not squared)
+				return true;
+
+			case MAGIC_SPOT:
+			{
+				out.type = ltype::spot;
+				read3(node, NODE_ROW3, out.pos);
+				read3(node, NODE_ROW1, out.dir);          // travel direction
+				normalize3(out.dir);
+				out.range = rd<float>(ls, L_SPOT_FAR);
+				const float outer = rd<float>(ls, L_SPOT_CONE_OUT);   // radians
+				const float inner = rd<float>(ls, L_SPOT_CONE_IN);
+				out.cone_outer_deg = outer * (180.0f / 3.14159265f);
+				out.cone_inner_deg = inner * (180.0f / 3.14159265f);
+				return true;
+			}
+
+			case MAGIC_DIRECT:
+				out.type = ltype::direct;
+				read3(node, NODE_ROW1, out.dir);
+				normalize3(out.dir);
+				return true;
+
+			case MAGIC_SUN:
+				out.type = ltype::sun;
+				read3(node, NODE_ROW1, out.dir);
+				normalize3(out.dir);
+				return true;
+
+			default:
+				g_stats.unknown_magic++;
+				return false;
+			}
+		}
+
+		// ---- LightingEnv::Update hook ----------------------------------------
+		// __thiscall(this, PtrArray<LightNode>* lights, GraphicNode* node) modelled
+		// as __fastcall so we receive `this` in ecx; edx is unused by the engine.
+		using PFN_Update = void(__fastcall*)(void* ecx, void* edx, void* lights, void* node);
+		PFN_Update o_lighting_update = nullptr;
+
+		void collect(void* lights)
+		{
+			if (!lights) return;
+
+			// PtrArray<LightNode>: data ptr @ +0, count = u16 @ +6 & 0x3FFF,
+			// elements are LightNode* (stride 4).
+			const auto* const* data = rd<const void* const*>(lights, 0);
+			const std::uint16_t count = rd<std::uint16_t>(lights, 6) & 0x3FFF;
+			if (!data || !count) return;
+
+			// Accumulate into THIS thread's bucket - no cross-thread contention.
+			tls_bucket& b = my_bucket();
+			std::lock_guard<std::mutex> lk(b.mtx);
+			for (std::uint16_t i = 0; i < count; ++i)
+			{
+				const void* node = data[i];
+				if (!node) continue;
+
+				g_stats.nodes_walked++;
+
+				light l;
+				if (!decode_node(node, l)) continue;
+				if (is_black(l.colour)) continue;   // zeroed / disabled slot
+
+				b.m[node] = l;                      // dedupe by stable node identity
+			}
+		}
+
+		// Merge every thread's bucket into `out` and clear them. Render thread only.
+		void drain_buckets(std::map<const void*, light>& out)
+		{
+			std::lock_guard<std::mutex> lk(s_buckets_mtx);
+			for (auto* b : s_buckets)
+			{
+				std::lock_guard<std::mutex> bl(b->mtx);
+				for (auto& [k, v] : b->m) out[k] = v;
+				b->m.clear();
+			}
+		}
+
+		void __fastcall hk_lighting_update(void* ecx, void* edx, void* lights, void* node)
+		{
+			o_lighting_update(ecx, edx, lights, node);   // let the engine build/select first
+			g_stats.update_calls++;
+			if (g_enabled)
+				collect(lights);
+		}
+
+		void install_hook()
+		{
+			const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
+			MH_Initialize();   // no-op if the framework already did it
+
+			auto* target = reinterpret_cast<void*>(base + RVA_LIGHTING_UPDATE);
+			if (MH_CreateHook(target, &hk_lighting_update,
+				reinterpret_cast<void**>(&o_lighting_update)) == MH_OK
+				&& MH_EnableHook(target) == MH_OK)
+			{
+				g_stats.hook_installed = true;
+			}
 		}
 	}
 
 	// Bring the Remix API up at the LAST safe moment rather than at ASI load.
-	// See the comment in comp::main(): initialising at load time creates Remix
-	// meshes before the device exists and crashes at startup. By the first Present
-	// d3d9.dll is loaded and the device is live.
-	//
-	// Off by default: this needs `exposeRemixApi = True` in <game>\.trex\bridge.conf,
-	// and without it initialize() fails harmlessly and we create no lights.
-	bool g_remix_api = false;
-
+	// Initialising at load time creates Remix meshes before the device exists and
+	// crashes at startup; by the first Present d3d9.dll is loaded and the device
+	// is live. Off by default: needs `exposeRemixApi = True` in bridge.conf.
 	static void ensure_remix_api()
 	{
 		if (!g_remix_api) return;
@@ -226,63 +322,18 @@ namespace comp::ac2_lights
 		});
 	}
 
-	void frame_end()
+	namespace
 	{
-		g_stats.frames++;
-		ensure_remix_api();
-
-		auto& api = shared::common::remix_api::get();
-		if (!api.is_initialized())
+		// Build a Remix light from `l` with the stable hash `id`, create it, and
+		// return the handle (null on failure). The EXT structs must live across the
+		// CreateLight call, so building and creating stay in one function.
+		remixapi_LightHandle create_light(const light& l, std::uint64_t id)
 		{
-			// Remix API not available => we can extract lights perfectly and still
-			// create none. That failure is INVISIBLE unless it is counted: the report
-			// would just show "0 lights" and look like a decode bug. It needs
-			// `exposeRemixApi = True` in <game>\.trex\bridge.conf.
-			g_stats.api_not_init++;
-			std::lock_guard<std::mutex> lk(s_mtx);
-			s_frame.clear();
-			return;
-		}
+			auto& api = shared::common::remix_api::get();
 
-		// HOME must be able to turn the lights back OFF, not just decline to
-		// initialise. ensure_remix_api() only gates init, and is_initialized() is
-		// permanent, so without this HOME is a ONE-WAY switch that cannot A/B.
-		//
-		// It has to A/B, because `rtx.fallbackLightMode` defaults to NoLightsPresent:
-		// Remix injects its own sun whenever no lights exist. For this whole project
-		// there were none, so the fallback sun lit every scene. The instant we submit
-		// a light it switches off and ours takes over - and BOTH look like "the sun
-		// works". Killing our last light brings the fallback straight back, so
-		// toggling HOME swings the sun between our direction and rtx.conf's. That
-		// difference is the only thing that proves whose light is on screen.
-		if (!g_remix_api)
-		{
-			for (auto h : s_handles) if (h) api.m_bridge.DestroyLight(h);
-			s_handles.clear();
-			std::lock_guard<std::mutex> lk(s_mtx);
-			s_frame.clear();
-			return;
-		}
-
-		std::map<std::uint64_t, light> frame;
-		{
-			std::lock_guard<std::mutex> lk(s_mtx);
-			frame.swap(s_frame);
-		}
-
-		// Retire last frame's lights. Remix's model is create-per-frame: a light
-		// handle lives for one frame, and the `hash` is what gives it identity
-		// across frames - which is why light_key() must be stable.
-		for (auto h : s_handles) if (h) api.m_bridge.DestroyLight(h);
-		s_handles.clear();
-
-		g_stats.unique_this_frame = static_cast<std::uint32_t>(frame.size());
-
-		for (const auto& [key, l] : frame)
-		{
 			remixapi_LightInfo info{};
 			info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-			info.hash = key;
+			info.hash = id;
 			info.radiance = remixapi_Float3D{
 				l.colour[0] * g_radiance_scale,
 				l.colour[1] * g_radiance_scale,
@@ -291,7 +342,7 @@ namespace comp::ac2_lights
 			remixapi_LightInfoSphereEXT sphere{};
 			remixapi_LightInfoDistantEXT distant{};
 
-			if (l.type == ltype::direct)
+			if (is_distant(l.type))
 			{
 				distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
 				distant.pNext = nullptr;
@@ -312,7 +363,6 @@ namespace comp::ac2_lights
 					sphere.shaping_value.direction =
 						remixapi_Float3D{ l.dir[0], l.dir[1], l.dir[2] };
 					sphere.shaping_value.coneAngleDegrees = l.cone_outer_deg;
-					// Soften across the inner->outer band the game itself defines.
 					const float band = l.cone_outer_deg - l.cone_inner_deg;
 					sphere.shaping_value.coneSoftness = (band > 0.0f)
 						? (std::min)(1.0f, band / (std::max)(1.0f, l.cone_outer_deg)) : 0.0f;
@@ -322,25 +372,155 @@ namespace comp::ac2_lights
 			}
 
 			remixapi_LightHandle h = nullptr;
-			if (api.m_bridge.CreateLight(&info, &h) != REMIXAPI_ERROR_CODE_SUCCESS || !h)
+			if (api.m_bridge.CreateLight(&info, &h) != REMIXAPI_ERROR_CODE_SUCCESS)
+				return nullptr;
+			return h;
+		}
+
+		// Tear down every live registry handle (HOME-off / shutdown / API loss).
+		void destroy_all_handles()
+		{
+			auto& api = shared::common::remix_api::get();
+			if (api.is_initialized())
+				for (auto& e : s_registry)
+					if (e.handle) { api.m_bridge.DestroyLight(e.handle); e.handle = nullptr; }
+		}
+	}
+
+	void frame_end()
+	{
+		// Install the engine hook once, from a point where the game is fully up.
+		static std::once_flag s_hook_once;
+		std::call_once(s_hook_once, install_hook);
+
+		g_stats.frames++;
+		ensure_remix_api();
+
+		auto& api = shared::common::remix_api::get();
+		if (!api.is_initialized())
+		{
+			// Remix API unavailable => we can decode lights perfectly and still
+			// create none. That failure is INVISIBLE unless counted. Needs
+			// `exposeRemixApi = True` in <game>\.trex\bridge.conf.
+			g_stats.api_not_init++;
+			std::map<const void*, light> discard;
+			drain_buckets(discard);   // keep the buckets from growing unbounded
+			return;
+		}
+
+		// HOME must be able to turn the lights back OFF, not just decline to
+		// initialise. is_initialized() is permanent, so without this HOME would be
+		// a one-way switch. Destroying our lights brings Remix's fallback sun
+		// straight back (rtx.fallbackLightMode = NoLightsPresent), which is the
+		// only thing that proves whose light is on screen.
+		if (!g_remix_api)
+		{
+			destroy_all_handles();
+			s_registry.clear();
+			std::map<const void*, light> discard;
+			drain_buckets(discard);
+			return;
+		}
+
+		std::map<const void*, light> frame;
+		drain_buckets(frame);
+
+		++s_frame_no;
+
+		// --- pointer-stability diagnostic: how many of this frame's LightNode
+		// pointers were also present last frame. ~100% here would mean the pointer
+		// WAS a viable identity and the flicker was a timing gap; low means the
+		// pointer churns and the spatial registry is doing the real work.
+		{
+			std::vector<const void*> cur;
+			cur.reserve(frame.size());
+			for (const auto& [node, l] : frame) cur.push_back(node);
+			std::uint32_t carry = 0;
+			for (auto* p : cur)
+				if (std::find(s_prev_ptrs.begin(), s_prev_ptrs.end(), p) != s_prev_ptrs.end())
+					++carry;
+			g_stats.ptr_prev = static_cast<std::uint32_t>(cur.size());
+			g_stats.ptr_carry = carry;
+			s_prev_ptrs.swap(cur);
+		}
+
+		g_stats.unique_this_frame = static_cast<std::uint32_t>(frame.size());
+		g_stats.omni_seen = g_stats.direct_seen = g_stats.spot_seen = g_stats.sun_seen = 0;
+		g_stats.matched_existing = 0;
+		g_stats.new_this_frame = 0;
+
+		// --- reconcile this frame's lights against the persistent registry -----
+		for (const auto& [node, l] : frame)
+		{
+			switch (l.type)
 			{
-				g_stats.create_fail++;
+			case ltype::omni:   g_stats.omni_seen++;   break;
+			case ltype::spot:   g_stats.spot_seen++;   break;
+			case ltype::direct: g_stats.direct_seen++; break;
+			case ltype::sun:    g_stats.sun_seen++;    break;
+			}
+
+			reg_entry* match = nullptr;
+			for (auto& e : s_registry)
+				if (e.last_seen != s_frame_no && same_light(e, l)) { match = &e; break; }
+
+			if (match)
+			{
+				g_stats.matched_existing++;
+				if (light_differs(match->l, l)) match->dirty = true;
+				match->l = l;
+				match->last_seen = s_frame_no;
+			}
+			else
+			{
+				g_stats.new_this_frame++;
+				s_registry.push_back(reg_entry{ l, nullptr, s_next_id++, s_frame_no, true });
+			}
+		}
+
+		// --- submit: create-once, redraw every frame, age out the rest ---------
+		// `drawn` is per-frame (== live lights on screen); `created` stays a lifetime
+		// total so churn is visible - it should plateau in a static scene.
+		g_stats.drawn = 0;
+		g_stats.draw_fail = 0;
+		for (auto it = s_registry.begin(); it != s_registry.end(); )
+		{
+			reg_entry& e = *it;
+
+			// Aged out: unseen for MAX_AGE frames => this light is really gone.
+			if (s_frame_no - e.last_seen > MAX_AGE)
+			{
+				if (e.handle) api.m_bridge.DestroyLight(e.handle);
+				it = s_registry.erase(it);
 				continue;
 			}
 
-			s_handles.push_back(h);
-			g_stats.created++;
+			// (Re)create the handle only when it does not exist or the light data
+			// changed. A static light is created ONCE and merely redrawn each frame,
+			// so Remix never sees it destroyed -> no flicker. The stable `id` keeps
+			// identity across the rare recreate too.
+			if (!e.handle || e.dirty)
+			{
+				if (e.handle) api.m_bridge.DestroyLight(e.handle);
+				e.handle = create_light(e.l, e.id);
+				e.dirty = false;
+				if (e.handle) g_stats.created++;
+				else          g_stats.create_fail++;
+			}
 
-			// CreateLight only DEFINES the light; it contributes nothing until it is
-			// submitted to the frame. Remix's own flashlight path does exactly this
-			// (remix_api.cpp: DrawLightInstance every begin_scene). Without this call
-			// the report happily counts hundreds "created" and the screen stays dark -
-			// a created-but-never-drawn light is indistinguishable from a decode bug.
-			if (api.m_bridge.DrawLightInstance(h) == REMIXAPI_ERROR_CODE_SUCCESS)
-				g_stats.drawn++;
-			else
-				g_stats.draw_fail++;
+			// CreateLight only DEFINES the light; it contributes nothing until
+			// submitted every frame (Remix's flashlight path does the same).
+			if (e.handle)
+			{
+				if (api.m_bridge.DrawLightInstance(e.handle) == REMIXAPI_ERROR_CODE_SUCCESS)
+					g_stats.drawn++;
+				else
+					g_stats.draw_fail++;
+			}
+			++it;
 		}
+
+		g_stats.registry_size = static_cast<std::uint32_t>(s_registry.size());
 
 		std::lock_guard<std::mutex> lk(s_mtx);
 		s_last_dump = std::move(frame);
@@ -349,38 +529,50 @@ namespace comp::ac2_lights
 	void dump(std::ostream& os)
 	{
 		std::lock_guard<std::mutex> lk(s_mtx);
-		os << "\n---- LIGHTS (game -> Remix) ----\n";
+		os << "\n---- LIGHTS (entity route: LightingEnv::Update walk) ----\n";
 		os << "  enabled              : " << (g_enabled ? "yes" : "no") << "\n";
+		os << "  hook installed       : " << (g_stats.hook_installed ? "yes" : "NO") << "\n";
 		os << "  radiance scale       : " << g_radiance_scale << "\n";
 		os << "  emitter radius (m)   : " << g_emitter_radius << "\n";
-		os << "  PS variants w/ lights: " << g_stats.ps_with_lights << "\n";
-		os << "  draws with lights    : " << g_stats.draws_with_lights << "\n";
-		os << "  light slots read     : omni=" << g_stats.omni_seen
-			<< " direct=" << g_stats.direct_seen << " spot=" << g_stats.spot_seen << "\n";
-		os << "  const not written yet: " << g_stats.const_miss << "\n";
-		os << "  unique last frame    : " << g_stats.unique_this_frame << "\n";
+		os << "  Update calls / frame : " << g_stats.update_calls
+			<< " over " << g_stats.frames << " frames\n";
+		os << "  light-node visits    : " << g_stats.nodes_walked
+			<< " (unknown magic " << g_stats.unknown_magic << ")\n";
+		os << "  unique last frame    : " << g_stats.unique_this_frame
+			<< "  (omni=" << g_stats.omni_seen << " spot=" << g_stats.spot_seen
+			<< " direct=" << g_stats.direct_seen << " sun=" << g_stats.sun_seen << ")\n";
+		os << "  registry (persistent): " << g_stats.registry_size
+			<< "  (matched " << g_stats.matched_existing
+			<< " / new " << g_stats.new_this_frame << " last frame)\n";
+		// node-ptr carry-over: if this is ~= ptr count, the LightNode pointer was a
+		// stable identity after all and the spatial registry is redundant; if it is
+		// much lower, the pointer churns frame-to-frame (why the pointer hash flickered).
+		os << "  node-ptr carry-over  : " << g_stats.ptr_carry
+			<< " / " << g_stats.ptr_prev << " last frame\n";
 		os << "  Remix lights created : " << g_stats.created
-			<< " (fail " << g_stats.create_fail << ")\n";
-		// created != drawn means the lights exist but were never submitted => invisible.
+			<< " lifetime (fail " << g_stats.create_fail << ")\n";
+		// DRAWN is per frame == live lights on screen. created should PLATEAU in a
+		// static scene; if it keeps climbing, identity is still churning (flicker).
 		os << "  Remix lights DRAWN   : " << g_stats.drawn
-			<< " (fail " << g_stats.draw_fail << ")\n";
-		os << "  frames / api not init: " << g_stats.frames
-			<< " / " << g_stats.api_not_init << "\n";
+			<< " this frame (fail " << g_stats.draw_fail << ")\n";
+		os << "  api not init frames  : " << g_stats.api_not_init << "\n";
 
 		os << "  sample (up to 12 of last frame's unique lights, WORLD space):\n";
 		int n = 0;
-		for (const auto& [k, l] : s_last_dump)
+		for (const auto& [node, l] : s_last_dump)
 		{
 			if (n++ >= 12) break;
 			const char* t = (l.type == ltype::omni) ? "omni  "
-				: (l.type == ltype::spot) ? "spot  " : "direct";
+				: (l.type == ltype::spot) ? "spot  "
+				: (l.type == ltype::sun) ? "sun   " : "direct";
 			os << "    " << t
-				<< "  pos " << l.pos[0] << "," << l.pos[1] << "," << l.pos[2]
-				<< "  col " << l.colour[0] << "," << l.colour[1] << "," << l.colour[2]
-				<< "  range " << l.range;
+				<< "  col " << l.colour[0] << "," << l.colour[1] << "," << l.colour[2];
+			if (l.type == ltype::omni || l.type == ltype::spot)
+				os << "  pos " << l.pos[0] << "," << l.pos[1] << "," << l.pos[2]
+				   << "  range " << l.range;
 			if (l.type == ltype::spot)
 				os << "  cone " << l.cone_inner_deg << ".." << l.cone_outer_deg << " deg";
-			if (l.type == ltype::direct)
+			if (l.type == ltype::direct || l.type == ltype::spot || l.type == ltype::sun)
 				os << "  dir " << l.dir[0] << "," << l.dir[1] << "," << l.dir[2];
 			os << "\n";
 		}
@@ -388,12 +580,8 @@ namespace comp::ac2_lights
 
 	void shutdown()
 	{
-		auto& api = shared::common::remix_api::get();
 		std::lock_guard<std::mutex> lk(s_mtx);
-		if (api.is_initialized())
-			for (auto h : s_handles) if (h) api.m_bridge.DestroyLight(h);
-		s_handles.clear();
-		for (auto& [ps, l] : s_ps_lights) ps->Release();
-		s_ps_lights.clear();
+		destroy_all_handles();
+		s_registry.clear();
 	}
 }

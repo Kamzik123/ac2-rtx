@@ -61,4 +61,14 @@ namespace comp::ac2_dump
 	// so the draw's vertices start at (BaseVertexIndex + MinVertexIndex), not 0.
 	void on_draw_indexed_prim(IDirect3DDevice9* dev, INT BaseVertexIndex,
 		UINT MinVertexIndex, UINT NumVertices);
+
+	// ---- perf triage ---------------------------------------------------------
+	// The frame is GPU-bound in Remix's path tracer, not in our CPU work (proven:
+	// removing CPU skinning via vertex capture, and every CPU optimisation, left
+	// fps unchanged). We keep only the top-line numbers: frame time / fps, our
+	// total draw-hook time, and draws/frame.
+	// perf_add_hook_ticks: accumulate QPC ticks spent in our draw hook (per draw).
+	// perf_present: call once per Present; rolls the accumulators into per-frame EMAs.
+	void perf_add_hook_ticks(long long qpc_ticks);
+	void perf_present();
 }

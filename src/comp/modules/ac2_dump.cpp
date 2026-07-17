@@ -146,6 +146,33 @@ namespace comp::ac2_dump
 			}
 			prev_skin = skin;
 
+			// F3: route SKINNED meshes to Remix vertex capture instead of CPU
+			// skinning + FF. Lets us A/B the GPU-skinned capture (look + perf) against
+			// our CPU path. Characters animate under capture; the open question is
+			// flicker. When ON, skinned draws pass through instead of being dropped.
+			static bool prev_svc = false;
+			const bool svc = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+			if (svc && !prev_svc)
+			{
+				ac2_ff::g_skin_vertex_capture = !ac2_ff::g_skin_vertex_capture;
+				Beep(ac2_ff::g_skin_vertex_capture ? 2400 : 500, 80);
+			}
+			prev_svc = svc;
+
+			// DELETE: toggle the frustum ANTI-CULL patches. Default ON forces every
+			// object frustum-visible (so off-screen geometry reaches Remix). Toggling
+			// OFF lets the game's own FRUSTUM culling run - deterministic (unlike the
+			// occlusion queries that flicker), so this is the test for whether ANY
+			// source-level culling can be stable under Remix. Big perf lever if it is.
+			static bool prev_ac = false;
+			const bool ac = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+			if (ac && !prev_ac)
+			{
+				ac2_ff::set_anticulling(!ac2_ff::g_anticull);
+				Beep(ac2_ff::g_anticull ? 2600 : 500, 80);
+			}
+			prev_ac = ac;
+
 			// END: CPU-generated vegetation trunks. Separates "the trunk port is
 			// wrong" from "the rest of the FF path is wrong" in one keypress - the
 			// same job INSERT does for coverage-vs-culling.
@@ -533,20 +560,6 @@ namespace comp::ac2_dump
 		int normal_reg = -1;
 		std::string normal_name;
 
-		// The per-draw light counts have to come from the constant TABLE, not from a
-		// constant: g_NumLights is VS-only, because the counts are baked into the
-		// pixel shader as literals (the PS variant IS the light count). But the table
-		// still declares how many registers each light array occupies, and the
-		// stride per light is fixed - so the declared size recovers the count:
-		//   g_OmniLights   @ c32, 2 regs/light  -> count = size/2  (max 4)
-		//   g_DirectLights @ c40, 2 regs/light  -> count = size/2  (max 2)
-		//   g_SpotLights   @ c44, 4 regs/light  -> count = size/4  (max 2)
-		// Verified against the asset shaders: PS variants declare c32x2 (1 omni) and
-		// VS declares c32x8 (the full 4), which matches the (4,2,2,1) clamp in
-		// LightingEnv::SelectAndSetLights.
-		int num_omni = 0, num_direct = 0, num_spot = 0;
-		bool has_sun = false;
-
 		D3DXCONSTANTTABLE_DESC desc{};
 		if (SUCCEEDED(ct->GetDesc(&desc)))
 		{
@@ -557,16 +570,6 @@ namespace comp::ac2_dump
 				D3DXCONSTANT_DESC cd{};
 				UINT n = 1;
 				if (FAILED(ct->GetConstantDesc(h, &cd, &n)) || !cd.Name) continue;
-
-				if (cd.RegisterSet == D3DXRS_FLOAT4)
-				{
-					const std::string ln = shared::utils::str_to_lower(cd.Name);
-					if (ln == "g_omnilights")        num_omni = static_cast<int>(cd.RegisterCount) / 2;
-					else if (ln == "g_directlights") num_direct = static_cast<int>(cd.RegisterCount) / 2;
-					else if (ln == "g_spotlights")   num_spot = static_cast<int>(cd.RegisterCount) / 4;
-					else if (ln == "g_shadoweddirect") has_sun = true;
-					continue;
-				}
 
 				if (cd.RegisterSet != D3DXRS_SAMPLER) continue;
 
@@ -622,7 +625,6 @@ namespace comp::ac2_dump
 		if (best < 0 && normal_reg >= 0)
 		{
 			ac2_ff::register_ps_diffuse_stage(shader, normal_reg, 4, normal_name.c_str(), true);
-			ac2_lights::register_ps_lights(shader, num_omni, num_direct, num_spot, has_sun);
 			return;
 		}
 
@@ -630,7 +632,6 @@ namespace comp::ac2_dump
 		// guess and the report needs to tell guesses apart from real matches.
 		ac2_ff::register_ps_diffuse_stage(shader, best,
 			(best >= 0) ? best_rank : -1, best_name.c_str());
-		ac2_lights::register_ps_lights(shader, num_omni, num_direct, num_spot, has_sun);
 	}
 
 	// -------------------------------------------------------------------------
@@ -791,6 +792,66 @@ namespace comp::ac2_dump
 		decl->Release();
 	}
 
+	// ---- perf triage --------------------------------------------------------
+	namespace
+	{
+		long long s_qpc_freq = 0;
+		long long s_qpc_last_present = 0;
+		long long s_hook_accum = 0;      // ticks in our draw hook, current frame
+		std::uint32_t s_draw_accum = 0;  // draws this frame
+
+		// exponential moving averages (per frame)
+		double s_ema_frame_ms = 0.0;
+		double s_ema_hook_ms = 0.0;
+		double s_ema_draws = 0.0;
+		bool   s_ema_primed = false;
+	}
+
+	void perf_add_hook_ticks(long long qpc_ticks)
+	{
+		s_hook_accum += qpc_ticks;
+		s_draw_accum++;
+	}
+
+	void perf_present()
+	{
+		LARGE_INTEGER now{};
+		QueryPerformanceCounter(&now);
+		if (!s_qpc_freq)
+		{
+			LARGE_INTEGER f{};
+			QueryPerformanceFrequency(&f);
+			s_qpc_freq = f.QuadPart ? f.QuadPart : 1;
+			s_qpc_last_present = now.QuadPart;
+			return;
+		}
+
+		const double frame_ms = 1000.0 * double(now.QuadPart - s_qpc_last_present) / double(s_qpc_freq);
+		const double hook_ms = 1000.0 * double(s_hook_accum) / double(s_qpc_freq);
+		s_qpc_last_present = now.QuadPart;
+		s_hook_accum = 0;
+		const double draws = double(s_draw_accum);
+		s_draw_accum = 0;
+
+		// Ignore absurd frames (load hitches, alt-tab) so the EMA stays meaningful.
+		if (frame_ms > 0.0 && frame_ms < 1000.0)
+		{
+			if (!s_ema_primed)
+			{
+				s_ema_frame_ms = frame_ms; s_ema_hook_ms = hook_ms;
+				s_ema_draws = draws;
+				s_ema_primed = true;
+			}
+			else
+			{
+				const double a = 0.05;
+				s_ema_frame_ms = s_ema_frame_ms * (1 - a) + frame_ms * a;
+				s_ema_hook_ms  = s_ema_hook_ms  * (1 - a) + hook_ms  * a;
+				s_ema_draws    = s_ema_draws    * (1 - a) + draws    * a;
+			}
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	void write_report()
 	{
@@ -810,6 +871,16 @@ namespace comp::ac2_dump
 		f << "Confirmed from shader constant tables: g_WorldViewProj = c0..c3,\n";
 		f << "g_BoneMatrixArray = c120..c245 (126 regs = 42 bones x 3).\n\n";
 		f << "report #             : " << (++s_reports_written) << "  (auto-flush every 15s; F8/F10 forces)\n";
+		{
+			const double fps = (s_ema_frame_ms > 0.0) ? (1000.0 / s_ema_frame_ms) : 0.0;
+			const double pct = (s_ema_frame_ms > 0.0) ? (100.0 * s_ema_hook_ms / s_ema_frame_ms) : 0.0;
+			char buf[192];
+			snprintf(buf, sizeof(buf),
+				"PERF (EMA)           : frame %.2f ms (%.1f fps) | our draw-hook %.2f ms/frame (%.0f%%) | %.0f draws/frame\n",
+				s_ema_frame_ms, fps, s_ema_hook_ms, pct, s_ema_draws);
+			f << buf;
+			f << "                       (GPU-bound in Remix's path tracer; hook is CPU-side only)\n";
+		}
 		f << "sampling enabled     : " << (g_enabled ? "yes" : "NO - press F9") << "\n";
 		f << "total draws seen     : " << s_total_draws << "\n";
 		f << "FF conversion (F7)   : " << (ac2_ff::g_enabled ? "ON" : "off")
@@ -819,8 +890,8 @@ namespace comp::ac2_dump
 			<< "\n";
 		f << "CPU skinning (F1)    : " << (ac2_ff::g_skinning ? "ON" : "off")
 			<< "   skinned draws: " << ac2_ff::g_skinned_draws << "\n";
-		f << "game anti-cull        : " << (ac2_ff::g_anticull
-			? "ON - VisualsCulling gate + entity VISIBLE bit forced" : "off") << "\n";
+		f << "anti-cull (DELETE)   : " << (ac2_ff::g_anticull
+			? "ON - VisualsCulling gate + entity VISIBLE bit forced" : "off - game frustum-culls") << "\n";
 		f << "CullAABB (PAGE DOWN) : " << (ac2_ff::g_cullaabb
 			? "ON - always 'intersecting'" : "off") << "\n";
 		f << "occlusion off (PAGE UP): " << (ac2_ff::g_occlusion_off

@@ -118,6 +118,7 @@ namespace comp
 		// create-per-frame with the hash carrying identity across frames, so this has
 		// to run every frame, before the present that consumes them.
 		ac2_lights::frame_end();
+		ac2_dump::perf_present();
 		return m_pIDirect3DDevice9->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 	}
 
@@ -625,12 +626,9 @@ namespace comp
 
 	HRESULT d3d9ex::D3D9Device::SetPixelShaderConstantF(UINT StartRegister, CONST float* pConstantData, UINT Vector4fCount)
 	{
-		// Shadow every PS constant write. The per-draw LIGHT SET lives here
-		// (g_OmniLights c32, g_DirectLights c40, g_SpotLights c44), and it is the
-		// only in-sync source for it: engine memory is stale at draw time because of
-		// the deferred command buffer, and Get* readback across the Remix bridge is
-		// not trustworthy. Same reasoning as the VS constant shadow.
-		ac2_lights::on_set_ps_constant_f(StartRegister, pConstantData, Vector4fCount);
+		// The old register/constant light path shadowed the PS light block here
+		// (g_OmniLights c32, ...). The entity route reads the engine's light nodes
+		// directly (ac2_lights.cpp), so nothing to harvest from PS constants.
 		return m_pIDirect3DDevice9->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
 	}
 

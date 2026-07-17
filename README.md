@@ -20,8 +20,12 @@ have never been seen on screen. Not finished — see [Open problems](#open-probl
 
 AC2 is a 32-bit, shader-based Direct3D 9 game (Ubisoft's *Scimitar* engine, later renamed Anvil).
 RTX Remix natively understands **fixed-function** D3D9 draw calls. It can also try to capture
-vertices out of vertex shaders, but on AC2 that path produces flickering geometry and T-posed
-characters.
+vertices out of vertex shaders, but on AC2 that path **flickers** and, when mixed with the
+fixed-function draws, **puts geometry in the wrong place** — vertex-captured draws carry the game's
+shader-space transform while our FF draws use the analytically-reconstructed camera, and Remix's
+single scene camera can't satisfy both (static meshes shift vertically). (Note: characters captured
+this way *do* animate correctly — an earlier claim that they came out T-posed was wrong; Remix
+captures the GPU-skinned output. The blockers are flicker + the camera-space mismatch, not T-pose.)
 
 So this mod hooks D3D9 and **re-issues AC2's draws through the fixed-function pipeline**: it
 decodes the game's compressed vertex formats into plain float vertices, reconstructs a real
@@ -507,6 +511,45 @@ bind pose — **a T-pose**. This is still the leading explanation for character 
 consistent with the entity-visible-bit bug above (universal "not visible" ⇒ universal T-pose).
 It has not been cleanly isolated yet.
 
+## Performance — geometry-bound, and it fights RT correctness
+
+The frame is **GPU-bound in Remix's path tracer** (Remix's own HUD confirms it), and the cost scales
+with the **instance count** Remix has to build into its BVH — which is exactly what the mod
+maximises (anti-cull forces everything visible, occlusion off). This was established by elimination,
+and the surprises are worth recording so nobody re-runs the experiments:
+
+- **Optimising our CPU path does nothing for fps.** A per-phase profiler (frame-time + per-block
+  QPC timers, since removed) put our draw-hook at ~18-20ms of a ~32ms frame — but cutting it moved
+  fps **zero**: the camera-inverse fix (12ms → 0.2ms), a parsed-declaration cache, a skinned
+  bind-pose cache. The render thread's work is not the bound. *(The camera-inverse and skin caches
+  were kept — they're correct and cheap; the decl cache too.)*
+- **Culling at the D3D layer does nothing either.** A cull that suppressed **half** the draws we
+  forward to Remix changed fps by 0. By the time the game calls `DrawIndexedPrimitive`, it has
+  already built the object and issued all its per-object state calls **across the 32→64-bit
+  bridge**; suppressing the draw saves only the draw call itself. Remix's own `rtx.antiCulling.*`
+  is powerless for the same reason — it "can only extend the life of objects the game still
+  submits." **The only cull that helps is one that stops the game issuing the object at all.**
+- **Remix quality settings (DLSS / resolution / bounces) don't change fps** — so it is not
+  pixel-shading bound, it is geometry/instance bound.
+
+That leaves **source-level culling**, and here RT correctness and performance are in direct tension:
+
+- **HW occlusion queries** (the game's big lever — re-enabling gave ~30 → 100 fps) **flicker badly
+  under Remix.** They are frame-delayed, and Remix re-hashes objects as they cull in and out, so the
+  scene "freaks out and breaks." Unusable. This is the core reason the mod force-submits everything.
+- **Frustum culling** (deterministic, `DELETE` toggles the anti-cull patches off) is stable and
+  gives a **modest** improvement, at the cost of off-screen geometry in reflections/shadows.
+  `rtx.antiCulling.object.enable` (now on) can retain some of it.
+- **Remix's own `rtx.viewDistance` cull** (`rtx.conf`) drops far geometry from the BVH Remix-side,
+  without the game-culling flicker — a clean knob to trade draw distance for fps.
+
+**Bottom line:** a fully stable image wants every instance submitted, which is slow; every cull that
+recovers the cost either flickers (occlusion) or removes geometry (frustum / view-distance). ~30fps
+with everything submitted looks like a practical ceiling for dense city content on this hardware,
+short of a Remix-side fix for instance stability under culling (the same class of problem GTA IV's
+mod forked dxvk-remix for). Levers exposed: `DELETE` (frustum anti-cull), `PAGE UP` (occlusion —
+flickers), and `rtx.viewDistance.*` / `rtx.antiCulling.*` in `rtx.conf`.
+
 ## Skinning
 
 CPU skinning rather than FF indexed vertex blending: with `D3DRS_INDEXEDVERTEXBLEND`, Remix would
@@ -592,13 +635,15 @@ Useful sampler map: `s7` = `g_ReflectionSampler`, `s8` = `g_DepthSampler`, `s9` 
 ## Lights
 
 **AC2 never calls `SetLight`** — it is forward-rendered with per-object light lists evaluated in
-the pixel shader. It uploads each per-draw light set as **shader constants**, and the current
-implementation reads those constants back: they ride the command buffer with the draw, so they
-cannot be stale. That path now reaches the screen — the sun is visibly correct — **but it flickers,
-mislocates lights, and never extracts the sun proper.** All three faults trace to the same root:
-we are reconstructing a *global* light set by hashing floats out of a *per-object* channel. The
-next step is to abandon that and walk the engine's light list directly (see "The entity route" at
-the end of this section).
+the pixel shader.
+
+**The live path is now the ENTITY ROUTE** (`ac2_lights.{hpp,cpp}`): we hook
+`scimitar::LightingEnv::Update` and read each light straight out of the engine's own `LightNode`
+structures, keyed on the `LightNode*` for stable cross-frame identity. This replaced the older
+register/constant path, which reached the screen but flickered, mislocated lights, and never
+extracted the sun — all because it reconstructed a *global* light set by hashing floats out of a
+*per-object* shader channel. The register decode is preserved below as reference (it is still the
+authority on what each field *means*); the entity route is documented at the end of this section.
 
 ### The register path (current implementation — works, but flawed)
 
@@ -654,9 +699,9 @@ dark. Blocker 1 masked blocker 2 perfectly. The only precedent in the tree is th
 DRAWN`** next to `created`; `created != drawn` is the signature and can no longer hide. **Fixed and
 confirmed on screen.**
 
-### Three faults that remain in the register path
+### Three faults of the register path (all fixed by the entity route, now live)
 
-These are why the entity route is the real fix, not more tuning:
+These are why the entity route replaced it, not more tuning. Kept as the rationale:
 
 1. **Flicker with a stationary camera — `light_key()` hashes colour through `lround`.** The
    identity key mixes `lround(colour)`. The lights' actual colours cluster in 0.2–0.8, where
@@ -681,32 +726,89 @@ These are why the entity route is the real fix, not more tuning:
    land, so the inner/outer mapping in `on_draw` is a guess — consistent with the nonsensical
    `cone 180..72 deg` seen in the report.
 
-### The entity route (the real fix — NOT yet done)
+### The entity route (the live path — Windows decode DONE)
 
-The symbolized Mac binary refutes the old claim that "there is no LightingEnv singleton to walk."
-`scimitar::LightingEnv` is a full class with the global light list in hand:
+We hook `scimitar::LightingEnv::Update` and walk its light-node list directly. **Every address and
+offset below is re-derived on the Windows exe** (`ida-pro-mcp`, IDB rebased to 0 ⇒ addresses are
+RVAs); the Mac binary was only the map of *what* to look for.
 
-- `LightingEnv::Update(PtrArray<LightNode>&, GraphicNode&)` @ Mac `0xbd1960` — receives the frame's
-  **global** light-node list, the exact thing the constant path is trying to rebuild.
-- `GetSunlightColor()` @ `0xbd0b80`, `GetSunlightDirection()` @ `0xbd0c00` — the sun, directly.
-- Per-node field offsets, read from the writers `SetOmniVectors`/`SetSpotVectors`/`SetSunLightVectors`:
-  world matrix at `node+0x40` (row 3 = position, row 1 = spot direction), light struct pointer at
-  `node+0xA8`; within it `intensity` at `[4]`, colour at `[67..69]`, near/far at `[72]/[73]` for
-  omni but `[75]/[76]` for spot — where `[72]/[73]` are instead **cone angles in radians**.
+**Hook point — `LightingEnv::Update` @ Win32 `0x1269E60`.** `__thiscall(this = graphicNode+0x90,
+PtrArray<LightNode>* lights, GraphicNode* node)`; modelled as `__fastcall(ecx, edx, lights, node)`
+to catch `this` in ecx (edx is unused). Found as the sole caller of `SelectAndSetLights`
+(`0x1269DB0`), whose Windows address the register work already had. It is called **per visible
+graphic node, on worker threads** (single-threaded caller `0x11B2840`, job/work-stealing caller
+`0x11B2C10`), so the light list is *per-object*, not one global list — but that no longer matters,
+because we dedupe on the `LightNode*`. The hook takes one mutex per node-list and reads only engine
+memory, so it holds it safely across the walk.
 
-Why it fixes all three faults at once: a `LightNode*` (or its `HandleManager` handle — see the
-`CreateHandle` calls in `UpdateShaderConstants`) is **stable identity for free**, killing the
-float-hash flicker; reading the node instead of guessed registers removes the camera-lights bug;
-and the sun is simply another node plus the two getters. It also *deletes* the dedupe machinery
-rather than patching it, because one node is one light — no per-object fan-out to re-merge.
+**`PtrArray<LightNode>`** (the `lights` arg): data pointer @ `+0`, count = `u16 @ +6 & 0x3FFF`,
+elements are `LightNode*` (stride 4).
 
-**The catch, stated honestly:** every offset above is from the **Mac** binary. The Windows layout
-(`LightingEnv::Update`, the `LightNode`/`*Light` field offsets, the `PtrArray` walk) must be
-re-derived on the Windows exe before anything is hooked. That porting is the bulk of the work.
+**`LightNode`:** world matrix @ `+0x40` (4×4 float, row-major) — **row 1 @ `+0x50` = direction**,
+**row 3 @ `+0x70` = world position**; light-struct pointer @ `+0xA8`.
 
-Implemented today in `ac2_lights.{hpp,cpp}`; needs `exposeRemixApi = True` in
-`<game>/.trex/bridge.conf` and `HOME` (a true on/off — it now destroys live lights when toggled
-off, so it can A/B against Remix's fallback sun).
+**light struct** (`*(node+0xA8)`), all authoritative from the four vector writers
+`LightingEnv::Set{Omni,Direct,Spot,Sun}Vectors` (`0x1268880` / `0x12681F0` / `0x1268970` /
+`0x12682B0`), dispatched by `WriteLightVectors` (`0x12691B0`):
+
+| field | offset | notes |
+|---|---|---|
+| type magic | `vtable[+0x14]()` | virtual getter; call it like the engine does |
+| intensity | `+0x14` `[5]` | float |
+| colour rgb | `+0x10C..+0x114` `[67..69]` | |
+| enabled | `u16 @ +0x11C`, bit `0x200` | `(w >> 9) & 1` |
+| omni near/far | `+0x120`/`+0x124` `[72]/[73]` | writer stores `far²` as `reg0.w` |
+| spot cone out/in | `+0x120`/`+0x124` `[72]/[73]` | **radians** (writer does `cos()`) |
+| spot near/far | `+0x12C`/`+0x130` `[75]/[76]` | |
+
+**Type magic → kind** (virtual @ `vtable+0x14`; identical values on Mac since they are class-name
+hashes, but note the **decompiler mis-signs them — these are the raw disasm immediates**):
+
+| magic | kind | Remix light |
+|---|---|---|
+| `0x7E15FD50` | direct (directional) | distant, dir = node row 1 |
+| `0x344780D6` | omni (point) | sphere, pos = node row 3 |
+| `0x80320FB8` | spot | sphere + shaping, pos row 3 / dir row 1 |
+| `0x5EDC3E04` | sun (shadowed directional) | distant, dir = node row 1 |
+
+The writers confirm the register semantics from the reference decode: omni `reg0 = {pos, far²}`;
+direct/sun `reg0 = -row1` (so travel direction = row 1); spot adds `reg2 = -row1` and
+`reg3 = {cos(outer), cos(inner), 1/(cosOut−cosIn)}`. Colour is emitted as
+`colour · intensity · (fade/255)`; we fold `colour·intensity` at collect time and apply
+`g_radiance_scale` at submit, so the magnitude matches the old premultiplied read.
+
+Position comes from the node's own world matrix, not a guessed (and dynamic) register; and the sun
+is just the node with magic `0x5EDC3E04` — no getters needed, it rides the same walk.
+
+**Identity — the real fix was create-once + age-out, not the hash.** The first cut keyed the Remix
+hash on the `LightNode*` and destroyed+recreated every light every frame; it flickered. The obvious
+theory was "the pointer churns, so the hash churns" — but the report's `node-ptr carry-over` counter
+later measured **3/3 stable**, refuting that. The actual cause was the **destroy-every-frame model
+colliding with a one-frame collection gap**: the node walk runs on worker threads, and on any frame
+where a light was momentarily absent from the collection (worker timing, or transient culling while
+moving) it got destroyed and not recreated — a blink. The flashlight avoids this only because its
+one light is always present to be re-created.
+
+The fix is a **persistent registry** (`ac2_lights.cpp`) whose handles are **created once and merely
+redrawn every frame**, recreated only when the light data changes or after it goes unseen for
+`MAX_AGE` (4) frames — so a momentary gap no longer blinks. Entries are matched frame-to-frame by
+position (5cm) / direction (~11°) rather than by pointer or a value hash: a tolerance match is
+**boundary-free**, honouring this repo's rule that identity must not come from quantising a value
+(any hard quantum has a boundary a jittering light can straddle). The spatial match turned out to be
+belt-and-braces given the pointer was stable, but it costs nothing and is robust if that ever
+changes. `created` is a lifetime counter that should **plateau** in a static scene; if it keeps
+climbing, identity is still churning.
+
+Needs `exposeRemixApi = True` in `<game>/.trex/bridge.conf` and `HOME` (a true on/off — it destroys
+live lights when toggled off, so it can A/B against Remix's fallback sun). The report prints
+`hook installed`, `light-node visits`, per-type unique counts, and `created`/`DRAWN` so a decode or
+hook regression is visible without a debugger.
+
+**Confirmed on screen:** lights show up correctly positioned and are **stable — the flicker is
+gone** (persistent spatial registry, above). **Still unverified** (cheap to check next): direction
+sign (row 1 assumed = travel direction, from the old working negate-the-register behaviour — flip
+if the sun is backwards), spot inner/outer assignment (`[72]`=outer/`[73]`=inner — swap if cones
+invert), and `g_radiance_scale` may need retuning now that colour and intensity are read separately.
 
 ## Remix-side tagging (not every bug is in this repo)
 

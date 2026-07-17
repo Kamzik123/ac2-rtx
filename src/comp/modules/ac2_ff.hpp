@@ -53,6 +53,15 @@ namespace comp::ac2_ff
 	extern bool g_skinning;
 	extern std::uint32_t g_skinned_draws;
 
+	// F3 test toggle: route skinned meshes to Remix's VERTEX CAPTURE instead of our
+	// CPU-skinning + fixed-function path. When ON, a skinned draw is neither
+	// converted nor dropped - the original shader draw runs and Remix captures its
+	// (GPU-skinned) output, so we can A/B how it looks and performs. g_skin_passthrough
+	// is the per-draw signal to the renderer that THIS draw must pass through the
+	// FF-ONLY drop; it is reset at the top of try_render_fixed_function.
+	extern bool g_skin_vertex_capture;
+	extern bool g_skin_passthrough;
+
 	// Game-side anti-culling. ALWAYS ON (applied on the first draw).
 	//
 	// The DELETE toggle was removed - the key was needed elsewhere and it had not

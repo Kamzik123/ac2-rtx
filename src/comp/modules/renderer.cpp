@@ -132,19 +132,26 @@ namespace comp
 			return dev->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
 		}
 
+		// Time our per-draw overhead so the report can show whether WE are the frame
+		// bottleneck or the bridge/GPU is. (It's the latter - see the PERF line.)
+		LARGE_INTEGER _t0{}, _t1{};
+		QueryPerformanceCounter(&_t0);
+
 		// Sample this draw's actual vertices (BaseVertexIndex + MinVertexIndex -
 		// AC2 packs many meshes per VB). F8/F10 flushes, F9 toggles sampling.
 		ac2_dump::on_draw_indexed_prim(dev, BaseVertexIndex, MinVertexIndex, NumVertices);
 
-		// Harvest this draw's light set from the pixel-shader constants. Must run
-		// BEFORE the FF conversion below: that path swaps the pixel shader out, and
-		// the bound PS is what tells us how many lights the draw actually uses.
-		ac2_lights::on_draw(dev);
+		// Lights are no longer harvested per draw: the entity route walks the
+		// engine's own light nodes via a LightingEnv::Update hook (ac2_lights.cpp)
+		// and submits them in frame_end().
 
 		// Fixed-function conversion for generic static meshes (F7 toggles, F6 wireframe).
 		// If it handles the draw, do not let the game issue it again.
-		if (ac2_ff::try_render_fixed_function(dev, PrimitiveType, BaseVertexIndex,
-			MinVertexIndex, NumVertices, startIndex, primCount))
+		const bool _ff_converted = ac2_ff::try_render_fixed_function(dev, PrimitiveType,
+			BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+		QueryPerformanceCounter(&_t1);
+		ac2_dump::perf_add_hook_ticks(_t1.QuadPart - _t0.QuadPart);
+		if (_ff_converted)
 		{
 			return D3D_OK;
 		}
@@ -152,7 +159,9 @@ namespace comp
 		// F4: isolate the FF path. Swallow every draw we couldn't convert so the
 		// scene contains ONLY fixed-function geometry - nothing vertex-captured.
 		// This is the test that tells us whether FF geometry is stable in Remix.
-		if (ac2_ff::g_enabled && ac2_ff::g_ff_only)
+		// Exception: when F3 (skinned vertex-capture test) flagged this draw, let it
+		// through so Remix captures the original shader draw.
+		if (ac2_ff::g_enabled && ac2_ff::g_ff_only && !ac2_ff::g_skin_passthrough)
 		{
 			return D3D_OK;
 		}
