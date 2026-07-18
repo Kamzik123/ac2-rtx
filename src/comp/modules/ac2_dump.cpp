@@ -246,6 +246,20 @@ namespace comp::ac2_dump
 			}
 			prev_ra = ra;
 
+			// '[' / ']': dim / brighten the point+spot lights (g_point_scale) by
+			// 1.5x per press, and rebuild the live handles so it shows up
+			// immediately. Only the SPHERE lights - the sun/direct scale is a
+			// different unit and is not touched, which is the whole point of
+			// having two. Tuning by eye against a torch is the only way to set
+			// this: the game's intensity units are arbitrary.
+			static bool prev_dim = false, prev_bri = false;
+			const bool dim = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0;   // '['
+			const bool bri = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;   // ']'
+			if (dim && !prev_dim) { ac2_lights::nudge_point_scale(1.0f / 1.5f); Beep(500, 60); }
+			if (bri && !prev_bri) { ac2_lights::nudge_point_scale(1.5f);        Beep(1800, 60); }
+			prev_dim = dim;
+			prev_bri = bri;
+
 			// F12: read constants from our shadow (default) vs the bridge's
 			// GetVertexShaderConstantF. Proves which one is lying.
 			static bool prev_cs = false;

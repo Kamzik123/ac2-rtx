@@ -9,7 +9,8 @@ namespace comp::ac2_lights
 	bool  g_enabled = true;
 	bool  g_remix_api = true;    // lights ON by default (HOME toggles); needs
 	                             // exposeRemixApi=True in bridge.conf (already set)
-	float g_radiance_scale = 20.0f;
+	float g_radiance_scale = 20.0f;   // distant lights: radiance == irradiance
+	float g_point_scale    = 20.0f;   // sphere lights: illuminance at 1 m (see .hpp)
 	float g_emitter_radius = 0.06f;
 	stats g_stats{};
 
@@ -133,6 +134,11 @@ namespace comp::ac2_lights
 
 		// pointer-stability diagnostic (informational only)
 		std::vector<const void*> s_prev_ptrs;
+
+		// Set when a tuning knob changes, so frame_end rebuilds every handle:
+		// the scales are NOT part of the light data light_differs() compares, so
+		// nothing would otherwise mark an existing light dirty.
+		std::atomic<bool> s_tuning_dirty{ false };
 
 		bool is_black(const float* c)
 		{
@@ -334,16 +340,19 @@ namespace comp::ac2_lights
 			remixapi_LightInfo info{};
 			info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 			info.hash = id;
-			info.radiance = remixapi_Float3D{
-				l.colour[0] * g_radiance_scale,
-				l.colour[1] * g_radiance_scale,
-				l.colour[2] * g_radiance_scale };
 
 			remixapi_LightInfoSphereEXT sphere{};
 			remixapi_LightInfoDistantEXT distant{};
 
 			if (is_distant(l.type))
 			{
+				// A distant light's radiance IS the arriving irradiance - no
+				// geometry term, so colour*intensity maps straight through.
+				info.radiance = remixapi_Float3D{
+					l.colour[0] * g_radiance_scale,
+					l.colour[1] * g_radiance_scale,
+					l.colour[2] * g_radiance_scale };
+
 				distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
 				distant.pNext = nullptr;
 				distant.direction = remixapi_Float3D{ l.dir[0], l.dir[1], l.dir[2] };
@@ -352,10 +361,24 @@ namespace comp::ac2_lights
 			}
 			else
 			{
+				// A sphere light's radiance is the EMITTER SURFACE radiance: the
+				// illuminance it delivers at distance d is radiance*pi*r^2/d^2,
+				// so the emitter area is baked into the brightness. Handing it the
+				// distant-light number made every omni/spot ~88x too dim at r=0.06
+				// AND made g_emitter_radius a hidden r^2 brightness control.
+				// Dividing by the area cancels both: g_point_scale is now the
+				// illuminance at 1 m, and the radius is pure softness.
+				const float r    = (std::max)(1e-3f, g_emitter_radius);
+				const float area = 3.14159265f * r * r;
+				const float k    = g_point_scale / area;
+
+				info.radiance = remixapi_Float3D{
+					l.colour[0] * k, l.colour[1] * k, l.colour[2] * k };
+
 				sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
 				sphere.pNext = nullptr;
 				sphere.position = remixapi_Float3D{ l.pos[0], l.pos[1], l.pos[2] };
-				sphere.radius = g_emitter_radius;   // emitter size, NOT l.range
+				sphere.radius = r;                  // emitter size, NOT l.range
 				sphere.shaping_hasvalue = (l.type == ltype::spot) ? TRUE : FALSE;
 				sphere.shaping_value = {};
 				if (l.type == ltype::spot)
@@ -385,6 +408,12 @@ namespace comp::ac2_lights
 				for (auto& e : s_registry)
 					if (e.handle) { api.m_bridge.DestroyLight(e.handle); e.handle = nullptr; }
 		}
+	}
+
+	void nudge_point_scale(float factor)
+	{
+		g_point_scale = (std::max)(0.01f, g_point_scale * factor);
+		s_tuning_dirty.store(true);
 	}
 
 	void frame_end()
@@ -483,6 +512,9 @@ namespace comp::ac2_lights
 		// total so churn is visible - it should plateau in a static scene.
 		g_stats.drawn = 0;
 		g_stats.draw_fail = 0;
+		// A tuning change ('[' / ']') alters radiance without altering the light
+		// data, so nothing above marked anything dirty. Do it here, once.
+		const bool retune = s_tuning_dirty.exchange(false);
 		for (auto it = s_registry.begin(); it != s_registry.end(); )
 		{
 			reg_entry& e = *it;
@@ -499,7 +531,7 @@ namespace comp::ac2_lights
 			// changed. A static light is created ONCE and merely redrawn each frame,
 			// so Remix never sees it destroyed -> no flicker. The stable `id` keeps
 			// identity across the rare recreate too.
-			if (!e.handle || e.dirty)
+			if (!e.handle || e.dirty || retune)
 			{
 				if (e.handle) api.m_bridge.DestroyLight(e.handle);
 				e.handle = create_light(e.l, e.id);
@@ -532,8 +564,18 @@ namespace comp::ac2_lights
 		os << "\n---- LIGHTS (entity route: LightingEnv::Update walk) ----\n";
 		os << "  enabled              : " << (g_enabled ? "yes" : "no") << "\n";
 		os << "  hook installed       : " << (g_stats.hook_installed ? "yes" : "NO") << "\n";
-		os << "  radiance scale       : " << g_radiance_scale << "\n";
-		os << "  emitter radius (m)   : " << g_emitter_radius << "\n";
+		// The two scales are in DIFFERENT units on purpose (a distant light's
+		// radiance is irradiance; a sphere light's is emitter-surface radiance).
+		// Print the area divisor too, so "why is the number we submit 300x the
+		// number I tuned" is answerable from the report alone.
+		const float r_dump = (std::max)(1e-3f, g_emitter_radius);
+		const float area_dump = 3.14159265f * r_dump * r_dump;
+		os << "  distant scale        : " << g_radiance_scale << "  (irradiance)\n";
+		os << "  point/spot scale     : " << g_point_scale
+			<< "  (illuminance @1m; submitted radiance = x" << (1.0f / area_dump)
+			<< " for r=" << g_emitter_radius << ")\n";
+		os << "  emitter radius (m)   : " << g_emitter_radius
+			<< "  (softness only - brightness is area-normalised)\n";
 		os << "  Update calls / frame : " << g_stats.update_calls
 			<< " over " << g_stats.frames << " frames\n";
 		os << "  light-node visits    : " << g_stats.nodes_walked

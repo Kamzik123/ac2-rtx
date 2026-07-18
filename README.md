@@ -98,6 +98,7 @@ rather than corrupting the game.
 | `F8` | Write report now (also auto-flushes every 15s) |
 | `F9` | Toggle sampling |
 | `F12` | Read constants from our shadow vs. the bridge |
+| `[` / `]` | Dim / brighten **point+spot** lights (`g_point_scale`, 1.5× per press, rebuilds live handles). Does not touch the sun/direct scale — different unit, see [Lights](#lights) |
 
 > `F4` is unusable — it opens an un-closable game debug menu. Don't bind it.
 
@@ -688,6 +689,44 @@ against `v3` (world position) and `g_EyePosition` (c12). Positions go to Remix u
   (`(fade * 0.00392) * intensity * colour`, confirmed in `SetOmniVectors`). The map to Remix
   radiance is a **tuning constant, not a derivation** (`g_radiance_scale`, currently 20).
 
+### `radiance` means two different things — the intensity-translation bug
+
+**Remix's `remixapi_LightInfo.radiance` is not one unit.** This was worth ~88× on every torch:
+
+| light | what `radiance` means | illuminance delivered |
+|---|---|---|
+| **distant** (direct/sun) | the **irradiance** arriving at a surface | `radiance` |
+| **sphere** (omni/spot) | the **emitter's surface radiance** | `radiance · π·r² / d²` |
+
+A sphere light's brightness therefore carries the **emitter area** in it. We handed both types the
+same `colour·intensity·g_radiance_scale`, so with `g_emitter_radius = 0.06` every omni and spot was
+scaled by `π·0.06² = 0.0113` — **~88× dimmer than the distant lights at 1 m**, and worse
+quadratically with distance. The relative intensity *between* point lights was preserved (it is
+linear), which is why this read as "the lights are there but the intensity doesn't translate"
+rather than as an obvious decode failure.
+
+The same root cause made `g_emitter_radius` a **hidden r² brightness control** while being
+documented as a pure softness knob: halving it for sharper shadows quartered every torch.
+
+**Fix (`create_light`):** divide the sphere radiance by the emitter area, and split the tunable in
+two, because the two are genuinely different quantities:
+
+- `g_radiance_scale` (distant) — irradiance, straight through.
+- `g_point_scale` (sphere) — **illuminance delivered at 1 m**; submitted radiance is
+  `colour · intensity · g_point_scale / (π·r²)`.
+
+Radius is now softness-only. The old, unit-broken behaviour was equivalent to `g_point_scale =
+20·π·0.06² = 0.226`, so the default of 20 is ~88× brighter — **expect to retune by eye**: `[` and
+`]` scale `g_point_scale` by 1.5× per press and force a handle rebuild (the scale is not part of
+the light data `light_differs()` compares, so without the forced rebuild a tuning change is
+invisible on already-created lights). The report prints both scales and the area divisor.
+
+**Still approximate, and known so:** the game's per-light **`range`/far is dropped entirely**. AC2
+applies a bounded falloff cutoff (`reg1.w = 1/(far²−near²)`); a Remix sphere light has true
+unbounded 1/d². Lights therefore spill further than the game intended — most visible where a
+small-range light sits near a large open area. Reinstating it would need a distance-matched
+intensity fit, not a direct transfer, since there is no range cutoff to set on a Remix light.
+
 ### `CreateLight` does not make a light — `DrawLightInstance` does
 
 `CreateLight` only *defines* the light and hands back a handle; it contributes nothing until
@@ -1014,6 +1053,20 @@ assumption). Cheap general guard: when adopting an API, diff your call sequence 
 working example in the tree, not against the struct definitions — `remixapi_LightInfo` gives no
 hint that a second call exists, and the flashlight was the only precedent for what a *complete*
 sequence looks like.
+
+**One field name, two units — check what a value MEANS per variant, not per struct.**
+`remixapi_LightInfo.radiance` is one field on one struct, so it read as one quantity; it is not. For
+a distant light it is the irradiance arriving at a surface, for a sphere light it is the emitter's
+*surface* radiance, and the sphere case therefore carries a `π·r²` area term the distant case does
+not. Feeding both the same number left every point light ~88× too dim. What made it survive so long
+is that the error was **purely multiplicative and applied uniformly**: relative intensity between
+torches was preserved perfectly, so it looked like a *tuning* problem ("scale needs retuning") and
+not a *units* problem — and a tuning constant is exactly the kind of thing nobody re-derives. The
+same missing area term also made `g_emitter_radius` a hidden r² brightness control while it was
+documented as a pure softness knob. **A scale factor that "just needs tuning" is worth deriving
+once**: if it cannot be written as an equation with units on both sides, the number is hiding a
+term. Corollary for tunables: after fixing this, brightness is area-normalised, so radius means
+only what its comment says.
 
 **The bug is not always in your code — and "plausible mechanism + matching symptom" is not
 evidence.** The disappearing building faces had a *beautiful* suspect: an unlocked buffer pool, on

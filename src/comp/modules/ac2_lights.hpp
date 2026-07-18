@@ -54,13 +54,37 @@ namespace comp::ac2_lights
 	// A/B'd against Remix's fallback sun.
 	extern bool g_remix_api;
 
-	// Radiance = (colour * intensity) * this. The game's colour and intensity are
-	// in arbitrary units, so the mapping to Remix radiance is a tuning constant.
+	// DISTANT lights (direct + sun) only. Remix's `radiance` for a distant light
+	// IS the irradiance arriving at a surface, so this is a straight
+	// radiance = colour * intensity * scale. The game's units are arbitrary, so
+	// the scale is a tuning constant.
 	extern float g_radiance_scale;
 
+	// SPHERE lights (omni + spot). NOT the same unit as g_radiance_scale, which
+	// is why they are separate variables - see create_light() in the .cpp. Remix
+	// reads a sphere light's `radiance` as the EMITTER SURFACE radiance, so the
+	// illuminance it actually delivers at distance d is
+	//     radiance * pi * r^2 / d^2
+	// i.e. the emitter AREA is baked into the brightness. Feeding it the same
+	// number as a distant light made every omni/spot ~88x too dim (pi*0.06^2 =
+	// 0.0113), which is the "intensity doesn't translate" bug. We divide by the
+	// area at submit time, so THIS value means: illuminance delivered at 1 metre,
+	// in the same arbitrary units as g_radiance_scale.
+	//
+	// The old (unit-broken) behaviour was equivalent to 20 * pi * 0.06^2 = 0.226.
+	extern float g_point_scale;
+
 	// Sphere emitter radius in metres. NOT the light's range (that is a falloff
-	// cutoff). Small = sharp shadows, large = soft.
+	// cutoff). Small = sharp shadows, large = soft. Because create_light divides
+	// the radiance by the emitter area, this is now a PURE softness knob -
+	// changing it no longer changes brightness (it used to change it by r^2).
 	extern float g_emitter_radius;
+
+	// Scale g_point_scale by `factor` and force every live handle to be rebuilt.
+	// Without the rebuild a tuning change is invisible: handles are created once
+	// and only recreated when the LIGHT DATA changes, and the scale is not part
+	// of that data. Bound to '[' / ']' - see ac2_dump.cpp.
+	void nudge_point_scale(float factor);
 
 	// Push this frame's unique lights to Remix and retire last frame's. Called
 	// from Present. Also installs the LightingEnv::Update hook on first call.
